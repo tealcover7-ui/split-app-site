@@ -42,21 +42,34 @@ async function cloudStore() {
     watch(gid, cb) {
       const state = { group: undefined, items: [], log: [], offline: false };
       const emit = () => { if (state.group !== undefined) cb({ ...state }); };
+      let stopped = false;
+      // Firestore ends a listener for good on any error. A refusal is expected right after
+      // creating a group (the rules check that the group exists on the server, and the
+      // create may not have arrived yet), so keep re-listening until it works.
+      const listen = (ref, opts, onNext) => {
+        let unsub = () => {};
+        const start = () => {
+          if (stopped) return;
+          unsub = fs.onSnapshot(ref, opts, onNext, () => setTimeout(start, 3000));
+        };
+        start();
+        return () => unsub();
+      };
       const unsubs = [
-        fs.onSnapshot(g(gid), { includeMetadataChanges: true }, (s) => {
+        listen(g(gid), { includeMetadataChanges: true }, (s) => {
           state.offline = s.metadata.fromCache;
           // A missing group seen only from the cache may just mean we have not loaded it yet.
           state.group = s.exists() ? s.data() : (s.metadata.fromCache ? 'loading' : null);
           emit();
-        }, () => { state.group = null; emit(); }),
-        fs.onSnapshot(fs.collection(db, 'groups', gid, 'items'), (s) => {
+        }),
+        listen(fs.collection(db, 'groups', gid, 'items'), {}, (s) => {
           state.items = s.docs.map((d) => d.data()); emit();
         }),
-        fs.onSnapshot(fs.query(fs.collection(db, 'groups', gid, 'log'), fs.orderBy('at', 'desc'), fs.limit(200)), (s) => {
+        listen(fs.query(fs.collection(db, 'groups', gid, 'log'), fs.orderBy('at', 'desc'), fs.limit(200)), {}, (s) => {
           state.log = s.docs.map((d) => d.data()); emit();
         }),
       ];
-      return () => unsubs.forEach((u) => u());
+      return () => { stopped = true; unsubs.forEach((u) => u()); };
     },
   };
 }
