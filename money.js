@@ -22,16 +22,41 @@ export const CURRENCIES = {
 
 const dec = (code) => (CURRENCIES[code] ? CURRENCIES[code].dec : 2);
 
-// "1,200.75" -> 120075 (USD). Returns null for anything that is not a positive amount.
+const GROUPED = /^\d{1,3}([.,]\d{3})+$/;          // 1,250,000 or 1.250.000
+const INDIAN = /^\d{1,2}(,\d{2})*,\d{3}$/;         // 1,25,000
+
+// Typed amount -> integer minor units, or null when it is not a clear positive amount.
+// People type "1,200.75", "1.200,75" (comma-decimal phones) and "50.000" (a Vietnamese price),
+// so separators are read by position, and anything ambiguous is refused rather than guessed.
 export function toMinor(text, code) {
-  const s = String(text ?? '').replace(/[,\s]/g, '');
-  if (!/^\d*\.?\d*$/.test(s) || s === '' || s === '.') return null;
+  const s = String(text ?? '').replace(/\s/g, '');
+  if (!/^[\d.,]+$/.test(s) || !/\d/.test(s)) return null;
   const d = dec(code);
-  const [whole, frac = ''] = s.split('.');
-  let minor = Number(whole || '0') * 10 ** d + Number((frac + '0'.repeat(d)).slice(0, d) || '0');
-  if (frac.length > d && Number(frac[d]) >= 5) minor += 1; // round half up on the extra digit
-  return Number.isSafeInteger(minor) ? minor : null;
+  let whole = s; let frac = '';
+  if (/[.,]/.test(s)) {
+    if (GROUPED.test(s) && (d === 0 || /^[^.]*$/.test(s) || (s.match(/\./g) || []).length > 1)) {
+      whole = s.replace(/[.,]/g, '');               // separators are thousands marks only
+    } else if (INDIAN.test(s)) {
+      whole = s.replace(/,/g, '');
+    } else if (d === 0) {
+      return null;                                  // no decimals exist in this currency
+    } else {
+      const at = Math.max(s.lastIndexOf('.'), s.lastIndexOf(','));
+      const other = s[at] === '.' ? ',' : '.';
+      whole = s.slice(0, at); frac = s.slice(at + 1);
+      if (frac.length > d || /[.,]/.test(frac) || whole.includes(s[at])) return null;
+      if (whole.includes(other) && !GROUPED.test(whole) && !INDIAN.test(whole)) return null;
+      whole = whole.replace(/[.,]/g, '');
+    }
+  }
+  const minor = Number(whole || '0') * 10 ** d + Number((frac + '0'.repeat(d)).slice(0, d) || '0');
+  return Number.isSafeInteger(minor) && minor > 0 ? minor : null;
 }
+
+// What to tell someone whose amount was refused.
+export const amountHelp = (code) => (dec(code) === 0
+  ? `Type the full amount with no decimals, like 50000. ${code} has no smaller unit.`
+  : 'Type the amount like 1250.50, with at most 2 decimals.');
 
 export const fromMinor = (minor, code) => minor / 10 ** dec(code);
 
@@ -41,14 +66,16 @@ export function formatMoney(minor, code) {
   const n = new Intl.NumberFormat(code === 'INR' ? 'en-IN' : 'en-US', {
     minimumFractionDigits: whole ? 0 : d, maximumFractionDigits: d,
   }).format(Math.abs(minor) / 10 ** d);
-  const sym = CURRENCIES[code] ? CURRENCIES[code].sym : code + ' ';
+  const sym = CURRENCIES[code] ? CURRENCIES[code].sym : ''; // never echo an unknown code into the page
   return (minor < 0 ? '-' : '') + sym + n;
 }
 
 // rate = units of `to` per 1 unit of `from`. Rounds once, to the nearest minor unit of `to`.
 export function convert(amountMinor, from, to, rate) {
   if (from === to) return amountMinor;
-  return Math.round((amountMinor / 10 ** dec(from)) * rate * 10 ** dec(to));
+  // The tiny nudge makes exact halves (8.075) round up even when floating point stores
+  // them a hair low (8.074999…).
+  return Math.round((amountMinor / 10 ** dec(from)) * rate * 10 ** dec(to) * (1 + 1e-12));
 }
 
 // Share an integer total by weight. Largest remainder; ties go to the earlier position.
@@ -103,11 +130,18 @@ export function balances(items, members, home) {
   return b;
 }
 
-// Fewest payments: repeatedly pay the largest creditor from the largest debtor.
+// A short list of payments that clears everyone: first pair off people whose amounts match
+// exactly, then repeatedly pay the largest creditor from the largest debtor. At most one
+// payment fewer than the number of people; usually, but not always, the fewest possible.
 export function settle(bal) {
   const ids = Object.keys(bal);
   const left = { ...bal };
   const plan = [];
+  for (const d of ids) {
+    if (!(left[d] < 0)) continue;
+    const c = ids.find((i) => left[i] === -left[d]);
+    if (c) { plan.push({ from: d, to: c, amount: left[c] }); left[d] = 0; left[c] = 0; }
+  }
   for (;;) {
     const debtor = ids.filter((i) => left[i] < 0).sort((p, q) => left[p] - left[q])[0];
     const creditor = ids.filter((i) => left[i] > 0).sort((p, q) => left[q] - left[p])[0];
