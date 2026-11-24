@@ -6,6 +6,10 @@ import { CURRENCIES, convert } from './money.js';
 export const GROUP_ID = /^[A-Za-z0-9]{20}$/;
 export const ITEM_ID = /^[A-Za-z0-9]{20}$/;
 export const MEMBER_ID = /^m[A-Za-z0-9]{8}$/;
+// The shared pool is kept as one more member with this fixed id, so the same maths and the
+// same database rules cover it. It can pay and receive, but never takes a share of an expense.
+export const POOL_ID = 'mPOOL0000';
+export const POOL_NAME = 'Trip pool';
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const MODES = ['equal', 'exact', 'percent', 'shares'];
 export const MAX_AMOUNT = 1e12;   // minor units; ten billion rupees
@@ -81,13 +85,17 @@ export function cleanData(d) {
     const it = cleanItem(raw, group.currency);
     // Money must stay between known people, or balances would stop adding up to zero.
     const people = !it ? [] : it.type === 'payment' ? [it.from, it.to] : [it.paidBy, ...Object.keys(it.split.weights)];
-    if (!it || !people.every((id) => known.has(id))) { unreadable += 1; continue; }
+    const poolShare = it && it.type === 'expense' && POOL_ID in it.split.weights;
+    if (!it || poolShare || !people.every((id) => known.has(id))) { unreadable += 1; continue; }
     items.push(it);
     if (!it.deleted) people.forEach((id) => used.add(id));
   }
   // A person marked as removed disappears only while no live expense or payment involves them,
   // so nobody can be removed with money still attached.
   const removed = isObj(d.group.removed) ? d.group.removed : {};
-  group.members = group.members.filter((m) => !(removed[m.id] === true && !used.has(m.id)));
+  group.members = group.members.filter((m) => m.id === POOL_ID || !(removed[m.id] === true && !used.has(m.id)))
+    .map((m) => (m.id === POOL_ID ? { id: m.id, name: POOL_NAME } : m));
+  group.people = group.members.filter((m) => m.id !== POOL_ID);
+  group.pool = group.members.length > group.people.length;
   return { group, items, used, log: (d.log || []).map(cleanLog).filter(Boolean), unreadable };
 }

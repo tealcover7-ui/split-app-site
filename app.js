@@ -1,7 +1,8 @@
 import {
   CURRENCIES, toMinor, fromMinor, formatMoney, convert, owedBy, balances, settle, validateSplit, amountHelp,
+  tripCosts, poolStats,
 } from './money.js';
-import { cleanData, GROUP_ID, MAX_AMOUNT, MAX_RATE } from './clean.js';
+import { cleanData, GROUP_ID, MAX_AMOUNT, MAX_RATE, POOL_ID, POOL_NAME } from './clean.js';
 import { openStore, newId } from './store.js';
 
 const $app = document.getElementById('app');
@@ -155,7 +156,7 @@ function draw() {
   const g = d.group;
   rememberGroup(view.gid, g.name);
   const me = getMe(view.gid);
-  if (!me || !g.members.some((m) => m.id === me)) return whoAmI(g, d, view.gid);
+  if (!me || !g.people.some((m) => m.id === me)) return whoAmI(g, d, view.gid);
   if (view.sub === 'e') { view.drawn = true; return expenseEditor(g, d, me); }
   if (view.sub === 'p') { view.drawn = true; return paymentEditor(g, d, me); }
   groupView(g, d, me);
@@ -247,7 +248,7 @@ function whoAmI(g, d, gid) {
     ${banners(d)}
     <div class="card"><div class="big">Who are you?</div>
       <p class="small">Pick your name so the app can show what you owe. This phone will remember it.</p>
-      <div class="list">${g.members.map((m) => `<button class="row" style="width:100%;background:none;border-radius:0" data-id="${esc(m.id)}">
+      <div class="list">${g.people.map((m) => `<button class="row" style="width:100%;background:none;border-radius:0" data-id="${esc(m.id)}">
         <span class="grow title" style="text-align:left">${esc(m.name)}</span>›</button>`).join('')}</div>
       <label for="newname">Not on the list? Add yourself</label>
       <div class="inline"><input id="newname" maxlength="30" placeholder="Your name"><button id="join">Join</button></div>
@@ -272,14 +273,14 @@ function csvCell(v) {
 function downloadCsv(g, items) {
   const home = g.currency; const f = (v, c) => fromMinor(v, c);
   const rows = [['Date', 'Type', 'Description', 'Paid by', 'Paid to', 'Amount', 'Currency', 'Rate', `Amount (${home})`,
-    ...g.members.map((m) => `${m.name} share (${home})`)]];
+    ...g.people.map((m) => `${m.name} share (${home})`)]];
   for (const x of [...items].reverse()) {
     if (x.type === 'payment') {
-      rows.push([x.date, 'Payment', '', nameOf(g, x.from), nameOf(g, x.to), f(x.amount, home), home, 1, f(x.amount, home), ...g.members.map(() => '')]);
+      rows.push([x.date, 'Payment', '', nameOf(g, x.from), nameOf(g, x.to), f(x.amount, home), home, 1, f(x.amount, home), ...g.people.map(() => '')]);
     } else {
       const owed = owedBy(x, g.members, home);
       rows.push([x.date, 'Expense', x.desc, nameOf(g, x.paidBy), '', f(x.amount, x.currency), x.currency, x.rate,
-        f(convert(x.amount, x.currency, home, x.rate), home), ...g.members.map((m) => f(owed[m.id], home))]);
+        f(convert(x.amount, x.currency, home, x.rate), home), ...g.people.map((m) => f(owed[m.id], home))]);
     }
   }
   const blob = new Blob(['﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv' });
@@ -297,29 +298,41 @@ function groupView(g, d, me) {
     .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt - a.createdAt);
   const bal = balances(items, g.members, home);
   const plan = settle(bal);
+  const costs = tripCosts(items, g.members, home);
+  const ps = g.pool ? poolStats(items, g.members, home, POOL_ID) : null;
+  const money = (v) => esc(formatMoney(v, home));
   const tab = (key, label, href) => `<a href="${esc(href)}" class="${sub === key ? 'on' : ''}">${label}</a>`;
   let body = '';
 
   if (sub === 'balances') {
     body = `
-      <div class="list">${g.members.map((m) => {
+      ${ps ? `<div class="card"><div class="small">Trip pool</div>
+        <div class="big ${ps.left < 0 ? 'neg' : ''}">${ps.left >= 0 ? money(ps.left) + ' left' : money(-ps.left) + ' overspent'}</div>
+        <div class="small">Put in ${money(ps.total)} · spent ${money(ps.spent)}${ps.left < 0 ? '. The pool has paid out more than was put in. Is a contribution missing?' : ''}</div>
+        <p style="margin:10px 0 0"><button id="topup">Add money to pool</button></p></div>` : ''}
+      <div class="list">${g.people.map((m) => {
         const v = bal[m.id];
         const you = m.id === me;
-        const txt = v > 0 ? `<span class="pos">${you ? 'get' : 'gets'} back ${esc(formatMoney(v, home))}</span>`
-          : v < 0 ? `<span class="neg">${you ? 'owe' : 'owes'} ${esc(formatMoney(-v, home))}</span>` : '<span class="small">settled up</span>';
-        return `<div class="row"><div class="grow title">${esc(nameOf(g, m.id, me))}</div><div class="right">${txt}</div></div>`;
+        const txt = v > 0 ? `<span class="pos">${you ? 'get' : 'gets'} back ${money(v)}</span>`
+          : v < 0 ? `<span class="neg">${you ? 'owe' : 'owes'} ${money(-v)}</span>` : '<span class="small">settled up</span>';
+        const c = costs[m.id];
+        return `<div class="row"><div class="grow"><div class="title">${esc(nameOf(g, m.id, me))}</div>
+          <div class="small">Trip cost ${money(c.cost)}${c.personal ? ` (${money(c.personal)} personal)` : ''}${ps ? ` · put in ${money(ps.paidIn[m.id])}` : ''}</div></div>
+          <div class="right">${txt}</div></div>`;
       }).join('')}</div>
       <h3>Suggested payments to settle</h3>
       ${plan.length ? `<div class="list">${plan.map((p, i) => `
         <div class="row"><div class="grow"><div class="title">${esc(nameOf(g, p.from, me))} → ${esc(nameOf(g, p.to, me))}</div>
-        <div class="small">${esc(formatMoney(p.amount, home))}</div></div>
+        <div class="small">${money(p.amount)}${p.from === POOL_ID ? ' · back from the pool' : p.to === POOL_ID ? ' · into the pool' : ''}</div></div>
         <button data-pay="${i}">Mark paid</button></div>`).join('')}</div>
         <p class="small">Tap “Mark paid” only after the money has really moved, and only one of you needs to.</p>`
       : '<p class="empty">Everyone is settled up.</p>'}
       <p class="inline" style="flex-wrap:wrap"><a class="btn" href="#/g/${esc(gid)}/p/new">Record another payment</a>
-        <button id="summary">Share summary</button><button id="csv">Download list</button></p>
+        <button id="summary">Share summary</button><button id="csv">Download list</button>
+        ${g.pool ? '' : '<button id="pool">Start a trip pool</button>'}</p>
+      ${g.pool ? '' : '<p class="small">A trip pool is money everyone puts into one kitty for common spending.</p>'}
       <h3>People</h3>
-      <div class="list">${g.members.map((m) => `<div class="row"><div class="grow title">${esc(m.name)}${m.id === me ? ' <span class="small">(you)</span>' : ''}</div>
+      <div class="list">${g.people.map((m) => `<div class="row"><div class="grow title">${esc(m.name)}${m.id === me ? ' <span class="small">(you)</span>' : ''}</div>
         <button data-rename="${esc(m.id)}">Rename</button>
         ${m.id !== me && !d.used.has(m.id) ? `<button class="danger" data-remove="${esc(m.id)}">Remove</button>` : ''}</div>`).join('')}</div>
       <div class="card">
@@ -339,7 +352,8 @@ function groupView(g, d, me) {
     body = `
       <div class="card"><div class="big ${mine > 0 ? 'pos' : mine < 0 ? 'neg' : ''}">${mine > 0 ? 'You get back ' + esc(formatMoney(mine, home))
         : mine < 0 ? 'You owe ' + esc(formatMoney(-mine, home)) : 'You are settled up'}</div>
-        <div class="small">Group spent ${esc(formatMoney(spent, home))} in total</div></div>
+        <div class="small">Your trip cost so far: ${money(costs[me].cost)}${costs[me].personal ? ` (${money(costs[me].personal)} personal)` : ''}${ps ? ` · pool has ${money(ps.left)} left` : ''}</div>
+        <div class="small">Group spent ${money(spent)} in total</div></div>
       ${items.length ? `<div class="list">${items.map((x) => itemRow(x, g, me, gid)).join('')}</div>`
       : '<p class="empty">No expenses yet. Tap “Add expense” when someone pays for something.</p>'}`;
   }
@@ -356,9 +370,16 @@ function groupView(g, d, me) {
   $app.querySelectorAll('[data-pay]').forEach((b) => {
     b.onclick = () => { prefill = plan[Number(b.dataset.pay)]; location.hash = `#/g/${gid}/p/new`; };
   });
+  $app.querySelector('#topup')?.addEventListener('click', () => { prefill = { from: me, to: POOL_ID, amount: 0 }; location.hash = `#/g/${gid}/p/new`; });
+  $app.querySelector('#pool')?.addEventListener('click', (e) => {
+    e.target.disabled = true;
+    store.addMember(gid, { id: POOL_ID, name: POOL_NAME });
+    log(gid, me, g, 'started a trip pool');
+  });
   $app.querySelector('#summary').onclick = () => {
     const lines = [`${g.name}: balances`,
-      ...g.members.map((m) => `${m.name}: ${bal[m.id] > 0 ? 'gets back ' + formatMoney(bal[m.id], home) : bal[m.id] < 0 ? 'owes ' + formatMoney(-bal[m.id], home) : 'settled up'}`)];
+      ...(ps ? [`Trip pool: ${formatMoney(ps.left, home)} left (put in ${formatMoney(ps.total, home)}, spent ${formatMoney(ps.spent, home)})`] : []),
+      ...g.people.map((m) => `${m.name}: ${bal[m.id] > 0 ? 'gets back ' + formatMoney(bal[m.id], home) : bal[m.id] < 0 ? 'owes ' + formatMoney(-bal[m.id], home) : 'settled up'}`)];
     if (plan.length) lines.push('', 'To settle:', ...plan.map((p) => `${nameOf(g, p.from)} pays ${nameOf(g, p.to)} ${formatMoney(p.amount, home)}`));
     shareText(g.name, lines.join('\n'));
   };
@@ -397,19 +418,28 @@ function groupView(g, d, me) {
 
 function itemRow(x, g, me, gid) {
   const home = g.currency;
+  const money = (v) => esc(formatMoney(v, home));
+  const day = `<div class="small" style="width:44px">${esc(shortDate(x.date))}</div>`;
   if (x.type === 'payment') {
-    return `<a class="row" href="#/g/${esc(gid)}/p/${esc(x.id)}"><div class="small" style="width:44px">${esc(shortDate(x.date))}</div>
-      <div class="grow"><div class="title">${esc(nameOf(g, x.from, me))} paid ${esc(nameOf(g, x.to, me))}</div><div class="small">Payment</div></div>
-      <div class="right">${esc(formatMoney(x.amount, home))}</div></a>`;
+    const title = x.to === POOL_ID ? `${nameOf(g, x.from, me)} put money in the pool`
+      : x.from === POOL_ID ? `${nameOf(g, x.to, me)} took money back from the pool`
+        : `${nameOf(g, x.from, me)} paid ${nameOf(g, x.to, me)}`;
+    return `<a class="row" href="#/g/${esc(gid)}/p/${esc(x.id)}">${day}
+      <div class="grow"><div class="title">${esc(title)}</div><div class="small">${x.to === POOL_ID || x.from === POOL_ID ? 'Pool' : 'Payment'}</div></div>
+      <div class="right">${money(x.amount)}</div></a>`;
   }
   const total = convert(x.amount, x.currency, home, x.rate);
   const myShare = owedBy(x, g.members, home)[me] || 0;
+  const sharers = Object.keys(x.split.weights);
+  const personal = sharers.length === 1;
   const foreign = x.currency !== home ? ` · ${esc(formatMoney(x.amount, x.currency))}` : '';
+  const tag = !personal ? '' : sharers[0] === x.paidBy ? ' · personal' : ` · personal (${esc(nameOf(g, sharers[0], me))})`;
   let mine;
-  if (x.paidBy === me) mine = total - myShare > 0 ? `<span class="pos">you lent<br>${esc(formatMoney(total - myShare, home))}</span>` : '<span class="small">just you</span>';
-  else mine = myShare > 0 ? `<span class="neg">you owe<br>${esc(formatMoney(myShare, home))}</span>` : '<span class="small">not in it</span>';
-  return `<a class="row" href="#/g/${esc(gid)}/e/${esc(x.id)}"><div class="small" style="width:44px">${esc(shortDate(x.date))}</div>
-    <div class="grow"><div class="title">${esc(x.desc)}</div><div class="small">${esc(nameOf(g, x.paidBy, me))} paid ${esc(formatMoney(total, home))}${foreign}</div></div>
+  if (x.paidBy === me) mine = total - myShare > 0 ? `<span class="pos">you lent<br>${money(total - myShare)}</span>` : '<span class="small">personal</span>';
+  else if (myShare > 0) mine = x.paidBy === POOL_ID ? `<span class="small">your share<br>${money(myShare)}</span>` : `<span class="neg">you owe<br>${money(myShare)}</span>`;
+  else mine = '<span class="small">not in it</span>';
+  return `<a class="row" href="#/g/${esc(gid)}/e/${esc(x.id)}">${day}
+    <div class="grow"><div class="title">${esc(x.desc)}</div><div class="small">${esc(nameOf(g, x.paidBy, me))} paid ${money(total)}${foreign}${tag}</div></div>
     <div class="right small">${mine}</div></a>`;
 }
 
@@ -440,7 +470,7 @@ function expenseEditor(g, d, me) {
   const f = old ? {
     desc: old.desc, amount: String(fromMinor(old.amount, old.currency)), currency: old.currency, rate: String(old.rate),
     date: old.date || today(), paidBy: old.paidBy, mode: old.split.mode,
-    vals: Object.fromEntries(g.members.map((m) => {
+    vals: Object.fromEntries(g.people.map((m) => {
       const w = old.split.weights[m.id] || 0;
       if (old.split.mode === 'equal') return [m.id, w > 0];
       if (old.split.mode === 'exact') return [m.id, w ? String(fromMinor(w, old.currency)) : ''];
@@ -448,8 +478,8 @@ function expenseEditor(g, d, me) {
     })),
   } : {
     desc: '', amount: '', currency: CURRENCIES[LS.get('split:cur:' + gid, home)] ? LS.get('split:cur:' + gid, home) : home,
-    rate: '', date: today(), paidBy: me, mode: 'equal',
-    vals: Object.fromEntries(g.members.map((m) => [m.id, true])),
+    rate: '', date: today(), paidBy: g.members.some((m) => m.id === LS.get('split:payer:' + gid, me)) ? LS.get('split:payer:' + gid, me) : me, mode: 'equal',
+    vals: Object.fromEntries(g.people.map((m) => [m.id, true])),
   };
   let rateNote = '';
 
@@ -466,6 +496,7 @@ function expenseEditor(g, d, me) {
       <label for="date">Date</label><input id="date" type="date" value="${esc(f.date)}">
       <label>Split</label>
       <div class="seg">${Object.entries(MODES).map(([k, v]) => `<button type="button" data-mode="${k}">${v}</button>`).join('')}</div>
+      <button type="button" id="justme" style="margin-top:8px">Just me (personal)</button>
       <div id="rows" style="margin-top:8px"></div>
       <div id="hint" class="hint"></div>
       <div class="actions">${old ? '<button class="danger" id="del">Delete</button>' : ''}<button class="primary" id="save">Save</button></div>
@@ -480,7 +511,7 @@ function expenseEditor(g, d, me) {
     const foreign = f.currency !== home;
     const rate = foreign ? num(f.rate) : 1;
     const weights = {};
-    for (const m of g.members) {
+    for (const m of g.people) {
       const v = f.vals[m.id];
       let w = 0;
       if (f.mode === 'equal') w = v ? 1 : 0;
@@ -494,7 +525,7 @@ function expenseEditor(g, d, me) {
     else if (!amount) error = amountHelp(f.currency);
     else if (amount > MAX_AMOUNT) error = 'That amount is too large.';
     else if (foreign && !(rate > 0 && rate <= MAX_RATE)) error = 'Enter the exchange rate.';
-    else if (f.mode === 'exact' && g.members.some((m) => String(f.vals[m.id] || '').trim() && !toMinor(f.vals[m.id], f.currency))) error = 'One of the exact amounts is not clear. ' + amountHelp(f.currency);
+    else if (f.mode === 'exact' && g.people.some((m) => String(f.vals[m.id] || '').trim() && !toMinor(f.vals[m.id], f.currency))) error = 'One of the exact amounts is not clear. ' + amountHelp(f.currency);
     else error = validateSplit(split, amount);
     return { amount, rate, split, error };
   }
@@ -509,7 +540,7 @@ function expenseEditor(g, d, me) {
 
   function drawRows() {
     $app.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === f.mode));
-    q('#rows').innerHTML = g.members.map((m) => {
+    q('#rows').innerHTML = g.people.map((m) => {
       const v = f.vals[m.id];
       const input = f.mode === 'equal'
         ? `<input type="checkbox" data-m="${esc(m.id)}" ${v ? 'checked' : ''}>`
@@ -528,7 +559,7 @@ function expenseEditor(g, d, me) {
     const hint = q('#hint');
     const ok = c.amount && (f.currency === home || (c.rate > 0 && c.rate <= MAX_RATE));
     const owed = ok ? owedBy({ amount: c.amount, currency: f.currency, rate: c.rate, split: c.split }, g.members, home) : {};
-    for (const m of g.members) {
+    for (const m of g.people) {
       const el = row(m.id, 'data-share');
       if (el) el.textContent = owed[m.id] ? formatMoney(owed[m.id], home) : '';
     }
@@ -565,10 +596,15 @@ function expenseEditor(g, d, me) {
     b.onclick = () => {
       if (f.mode === b.dataset.mode) return;
       f.mode = b.dataset.mode;
-      for (const m of g.members) f.vals[m.id] = f.mode === 'equal' ? true : f.mode === 'shares' ? '1' : '';
+      for (const m of g.people) f.vals[m.id] = f.mode === 'equal' ? true : f.mode === 'shares' ? '1' : '';
       drawRows(); refresh();
     };
   });
+  q('#justme').onclick = () => {
+    f.mode = 'equal';
+    for (const m of g.people) f.vals[m.id] = m.id === me;
+    drawRows(); refresh();
+  };
 
   let done = false;
   q('#save').onclick = () => {
@@ -587,6 +623,7 @@ function expenseEditor(g, d, me) {
     };
     store.putItem(gid, item);
     LS.set('split:cur:' + gid, f.currency);
+    LS.set('split:payer:' + gid, f.paidBy);
     const total = formatMoney(convert(item.amount, item.currency, home, item.rate), home);
     log(gid, me, g, `${old ? 'edited' : 'added'} “${desc}” (${total}, paid by ${nameOf(g, item.paidBy, null)})`);
     location.hash = '#/g/' + gid;
@@ -617,11 +654,11 @@ function paymentEditor(g, d, me) {
   const pre = isNew ? prefill : null; prefill = null;
   const has = (mid) => g.members.some((m) => m.id === mid);
   const from = old ? old.from : (pre && has(pre.from) ? pre.from : me);
-  const to = old ? old.to : (pre && has(pre.to) ? pre.to : g.members.find((m) => m.id !== from)?.id);
+  const to = old ? old.to : (pre && has(pre.to) ? pre.to : g.people.find((m) => m.id !== from)?.id);
   const amt = old ? old.amount : (pre ? pre.amount : 0);
   const opts = (sel) => g.members.map((m) => `<option value="${esc(m.id)}" ${m.id === sel ? 'selected' : ''}>${esc(nameOf(g, m.id, me))}</option>`).join('');
   render(`
-    <header class="top">${back('#/g/' + gid + '/balances')}<h1>${old ? 'Edit payment' : 'Record a payment'}</h1></header>
+    <header class="top">${back('#/g/' + gid + '/balances')}<h1>${old ? 'Edit payment' : to === POOL_ID ? 'Add money to pool' : 'Record a payment'}</h1></header>
     <div class="card">
       <label for="from">Who paid</label><select id="from">${opts(from)}</select>
       <label for="to">Paid to</label><select id="to">${opts(to)}</select>

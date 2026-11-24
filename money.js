@@ -152,3 +152,35 @@ export function settle(bal) {
     left[creditor] -= amount;
   }
 }
+
+// What the trip cost each member: their share of every live expense. `personal` is the part
+// from expenses that were theirs alone.
+export function tripCosts(items, members, home) {
+  const out = Object.fromEntries(members.map((m) => [m.id, { cost: 0, personal: 0 }]));
+  for (const it of items) {
+    if (it.deleted || it.type === 'payment') continue;
+    const owed = owedBy(it, members, home);
+    const sharers = Object.keys(owed).filter((id) => owed[id] > 0);
+    for (const id of sharers) {
+      out[id].cost += owed[id];
+      if (sharers.length === 1) out[id].personal += owed[id];
+    }
+  }
+  return out;
+}
+
+// The shared pool, held as a member of the group. `paidIn` is per person, net of anything the
+// pool handed back to them; `left` is the cash that should still be in the pool.
+export function poolStats(items, members, home, poolId) {
+  const paidIn = Object.fromEntries(members.filter((m) => m.id !== poolId).map((m) => [m.id, 0]));
+  let spent = 0;
+  for (const it of items) {
+    if (it.deleted) continue;
+    if (it.type === 'payment') {
+      if (it.to === poolId && it.from in paidIn) paidIn[it.from] += it.amount;
+      if (it.from === poolId && it.to in paidIn) paidIn[it.to] -= it.amount;
+    } else if (it.paidBy === poolId) spent += convert(it.amount, it.currency, home, it.rate);
+  }
+  const total = Object.values(paidIn).reduce((s, x) => s + x, 0);
+  return { paidIn, total, spent, left: total - spent };
+}
