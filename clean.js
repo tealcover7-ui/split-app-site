@@ -84,9 +84,12 @@ export function cleanData(d) {
   for (const raw of d.items || []) {
     const it = cleanItem(raw, group.currency);
     // Money must stay between known people, or balances would stop adding up to zero.
+    // A phone on an older version treats the pool as a person and may give it a share.
+    // The pool never takes a share: drop it, and the rest is split among the real people.
+    if (it && it.type === 'expense' && POOL_ID in it.split.weights) delete it.split.weights[POOL_ID];
     const people = !it ? [] : it.type === 'payment' ? [it.from, it.to] : [it.paidBy, ...Object.keys(it.split.weights)];
-    const poolShare = it && it.type === 'expense' && POOL_ID in it.split.weights;
-    if (!it || poolShare || !people.every((id) => known.has(id))) { unreadable += 1; continue; }
+    const empty = it && it.type === 'expense' && Object.keys(it.split.weights).length === 0;
+    if (!it || empty || !people.every((id) => known.has(id))) { unreadable += 1; continue; }
     items.push(it);
     if (!it.deleted) people.forEach((id) => used.add(id));
   }

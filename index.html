@@ -64,7 +64,11 @@ h3 { font-size: 16px; margin: 20px 0 6px; }
 label { display: block; font-size: 14px; color: var(--muted); margin: 12px 0 4px; }
 input, select { font: inherit; width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
   background: var(--card); color: var(--ink); }
-input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--accent); }
+input, select { min-width: 0; max-width: 100%; }
+/* iPhone draws date boxes at their own width, wider than the card, unless its styling is switched off */
+input[type=date] { -webkit-appearance: none; appearance: none; display: block; min-height: 46px; text-align: left; }
+input[type=date]::-webkit-date-and-time-value { text-align: left; }
+input[type=checkbox] { width: 24px; height: 24px; flex: none; accent-color: var(--accent); }
 .inline { display: flex; gap: 8px; align-items: center; }
 .inline > * { min-width: 0; }
 .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }

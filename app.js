@@ -21,6 +21,8 @@ let live = null;      // { gid, data, unsub }; data is cleaned, or { status }
 let view = null;      // { gid, sub, id, drawn }
 let lastHtml = '';
 let prefill = null;   // a suggested payment tapped on the Balances tab
+let build = '';       // fingerprint of the running version, shown on the home screen
+let updateReady = false; // a newer version is installed and waiting for a safe moment to load
 
 // ---------- small helpers ----------
 function toast(msg) {
@@ -109,6 +111,8 @@ function log(gid, me, g, text) {
 
 // ---------- routing ----------
 function route() {
+  // A newer version arrived while a form was open: load it now that the form is closed.
+  if (updateReady) { updateReady = false; location.reload(); return; }
   const parts = location.hash.replace(/^#\/?/, '').split('?')[0].split('/').filter(Boolean);
   window.scrollTo(0, 0);
   document.querySelector('.toast')?.remove();
@@ -177,6 +181,7 @@ function homeView() {
       <button class="icon" data-forget="${esc(x.id)}" aria-label="Remove from this phone">×</button></div>`).join('')}</div>
       <p class="small">× only takes a group off this phone’s list. The group and its link keep working.</p>`
     : '<p class="empty">No groups on this phone yet.<br>Starting a trip? Make the group once, then send its link to everyone.</p>'}
+    <p class="small" id="build" style="text-align:center;margin-top:24px">${build ? 'Version ' + esc(build) : ''}</p>
     <a class="btn primary fab" href="#/new">+ New group</a>`, true);
   $app.querySelector('#openlink').onclick = () => {
     const v = $app.querySelector('#paste').value.trim();
@@ -564,7 +569,7 @@ function expenseEditor(g, d, me) {
         : `<input data-m="${esc(m.id)}" inputmode="decimal" value="${esc(v)}" placeholder="0">`;
       const unit = f.mode === 'exact' ? esc(f.currency) : f.mode === 'percent' ? '%' : f.mode === 'shares' ? 'shares' : '';
       return `<label class="split-row" style="margin:0;color:inherit"><span class="name">${esc(nameOf(g, m.id, me))}
-        <span class="small" data-share="${esc(m.id)}" style="display:block"></span></span>${input}<span class="small" style="width:44px">${unit}</span></label>`;
+        <span class="small" data-share="${esc(m.id)}" style="display:block"></span></span>${input}${unit ? `<span class="small" style="width:44px">${unit}</span>` : ''}</label>`;
     }).join('');
     $app.querySelectorAll('[data-m]').forEach((i) => {
       i.oninput = i.onchange = () => { f.vals[i.dataset.m] = i.type === 'checkbox' ? i.checked : i.value; refresh(); };
@@ -733,7 +738,32 @@ async function start() {
   window.addEventListener('hashchange', route);
   route();
 }
-if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+// Keeps every phone on the latest published version. The saved copy opens instantly (and
+// offline); the app then asks the site for a newer one, and when it has been downloaded the
+// page reloads by itself, or waits until an open form is closed.
+async function keepUpdated() {
+  if (!('serviceWorker' in navigator) || !(location.protocol === 'https:' || location.hostname === 'localhost')) return;
+  const hadWorker = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadWorker || reloading) return; // the very first install is not an update
+    const formOpen = view && view.drawn && (view.sub === 'e' || view.sub === 'p');
+    if (formOpen) { updateReady = true; toast('A newer version is ready. It will load when you leave this form.'); return; }
+    reloading = true; location.reload();
+  });
+  try {
+    const reg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
+    const check = () => reg.update().catch(() => {});
+    // A home-screen app is often only resumed, never reopened, so ask again each time it comes back.
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    setInterval(check, 30 * 60 * 1000);
+    check();
+  } catch { /* no offline support in this browser; the app still works online */ }
+  try {
+    build = (await caches.keys()).filter((k) => k.startsWith('split-')).map((k) => k.slice(6)).pop() || '';
+    const el = document.getElementById('build');
+    if (el && build) el.textContent = 'Version ' + build;
+  } catch { /* no cache storage */ }
 }
+keepUpdated();
 start();
