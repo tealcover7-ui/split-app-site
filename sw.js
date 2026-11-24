@@ -1,7 +1,7 @@
 // Makes the app open with no signal. Each published version is downloaded whole into its own
 // cache and served from there, so a phone never runs a mix of old and new files.
 // VERSION is written by tools/stamp.mjs (npm test fails if it is out of date).
-const VERSION = 'b1cb0715cf';
+const VERSION = '1def917a8f';
 const CACHE = 'split-' + VERSION;
 const SHELL = ['./', 'index.html', 'app.js', 'money.js', 'clean.js', 'store.js', 'firebase-config.js',
   'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
