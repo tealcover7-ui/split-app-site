@@ -168,13 +168,22 @@ function homeView() {
   render(`
     <header class="top"><h1>Split</h1></header>
     ${banners(null)}
+    <div class="card"><div class="title">Joining friends?</div>
+      <p class="small" style="margin:4px 0 10px">Every group has its own link. Open the link your friend sent, or paste it here. Do not make a new group: that starts a separate one nobody else can see.</p>
+      <div class="inline"><input id="paste" placeholder="Paste the group link" autocapitalize="off" autocomplete="off" spellcheck="false"><button id="openlink">Open</button></div></div>
     ${groups.length ? `<div class="list">${groups.map((x) => `
       <div class="row"><a class="grow plain" href="#/g/${esc(x.id)}"><div class="title">${esc(x.name)}</div>
       <div class="small">Last opened ${esc(stamp(x.at))}</div></a>
       <button class="icon" data-forget="${esc(x.id)}" aria-label="Remove from this phone">×</button></div>`).join('')}</div>
       <p class="small">× only takes a group off this phone’s list. The group and its link keep working.</p>`
-    : '<p class="empty">No groups yet.<br>Make one for your next trip, then send the link to your friends.</p>'}
+    : '<p class="empty">No groups on this phone yet.<br>Starting a trip? Make the group once, then send its link to everyone.</p>'}
     <a class="btn primary fab" href="#/new">+ New group</a>`, true);
+  $app.querySelector('#openlink').onclick = () => {
+    const v = $app.querySelector('#paste').value.trim();
+    const id = (v.match(/#\/g\/([A-Za-z0-9]{20})(?![A-Za-z0-9])/) || v.match(/^([A-Za-z0-9]{20})$/) || [])[1];
+    if (!id) return toast('That is not a group link. A group link ends in #/g/ and 20 letters and numbers.');
+    location.hash = '#/g/' + id;
+  };
   $app.querySelectorAll('[data-forget]').forEach((b) => {
     b.onclick = () => {
       const x = groups.find((q) => q.id === b.dataset.forget);
@@ -189,6 +198,7 @@ function newGroupView() {
   render(`
     <header class="top">${back('#/')}<h1>New group</h1></header>
     ${banners(null)}
+    <div class="banner">Only one person makes the group. If a friend already made it, go back and open their link instead.</div>
     <div class="card">
       <label for="gname">Group name</label><input id="gname" placeholder="Vietnam trip 2026" maxlength="60">
       <label for="gcur">Main currency (balances are shown in this; it cannot be changed later)</label><select id="gcur">${currencyOptions('INR', 'INR')}</select>
@@ -224,6 +234,7 @@ function newGroupView() {
     LS.set(meKey(gid), members[0].id);
     LS.set('split:myname', myName);
     rememberGroup(gid, name);
+    LS.set('split:nudge:' + gid, true);
     log(gid, members[0].id, group, `created the group with ${names.join(', ')}`);
     location.hash = '#/g/' + gid;
   };
@@ -247,7 +258,7 @@ function whoAmI(g, d, gid) {
     <header class="top">${back('#/')}<h1>${esc(g.name)}</h1></header>
     ${banners(d)}
     <div class="card"><div class="big">Who are you?</div>
-      <p class="small">Pick your name so the app can show what you owe. This phone will remember it.</p>
+      <p class="small">You are joining “${esc(g.name)}”. Pick your name so the app can show what you owe. This phone will remember it.</p>
       <div class="list">${g.people.map((m) => `<button class="row" style="width:100%;background:none;border-radius:0" data-id="${esc(m.id)}">
         <span class="grow title" style="text-align:left">${esc(m.name)}</span>›</button>`).join('')}</div>
       <label for="newname">Not on the list? Add yourself</label>
@@ -361,11 +372,17 @@ function groupView(g, d, me) {
   if (!render(`
     <header class="top">${back('#/')}<h1>${esc(g.name)}</h1><button id="share">Share link</button></header>
     ${banners(d)}
+    ${LS.get('split:nudge:' + gid, false) ? `<div class="card"><div class="title">Next: send this group’s link</div>
+      <p class="small" style="margin:4px 0 10px">Friends see this group only by opening its link. If they make their own group, it will be a separate one.</p>
+      <div class="inline"><button class="primary" id="nudgeshare">Share link</button><button id="nudgedone">Done</button></div></div>` : ''}
     <nav class="tabs">${tab('expenses', 'Expenses', `#/g/${gid}`)}${tab('balances', 'Balances', `#/g/${gid}/balances`)}${tab('activity', 'Activity', `#/g/${gid}/activity`)}</nav>
     ${body}
     <a class="btn primary fab" href="#/g/${esc(gid)}/e/new">+ Add expense</a>`)) return;
 
   $app.querySelector('#share').onclick = () => shareGroup(g, gid);
+  const endNudge = () => { LS.set('split:nudge:' + gid, false); lastHtml = ''; draw(); };
+  $app.querySelector('#nudgeshare')?.addEventListener('click', () => { shareGroup(g, gid); endNudge(); });
+  $app.querySelector('#nudgedone')?.addEventListener('click', endNudge);
   if (sub !== 'balances') return;
   $app.querySelectorAll('[data-pay]').forEach((b) => {
     b.onclick = () => { prefill = plan[Number(b.dataset.pay)]; location.hash = `#/g/${gid}/p/new`; };
