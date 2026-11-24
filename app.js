@@ -92,6 +92,46 @@ async function fetchRate(from, to) {
   return rate > 0 && rate <= MAX_RATE ? { rate, date: c.date } : null;
 }
 
+// Loose number: "1,60,000", "1005", "159.2", "0.00628".
+const loose = (v) => { const m = toMinor(v, 'USD'); return m ? m / 100 : num(v); };
+// An exchange rate held the way people state it: "a CUR = b HOME". `kept` is an exact rate
+// (from a saved entry or the rate service) used until someone types over it.
+const rateState = (r) => { const x = { a: '', b: '', kept: null }; if (r > 0) setRate(x, r); return x; };
+function setRate(x, r) {
+  x.kept = r;
+  if (r < 1) { x.a = String(+(1 / r).toPrecision(6)); x.b = '1'; } else { x.a = '1'; x.b = String(+r.toPrecision(6)); }
+}
+const rateOf = (x) => (x.kept != null ? x.kept : (loose(x.a) > 0 ? loose(x.b) / loose(x.a) : 0));
+// The rate this group last used for a currency: for cash changed once, that is the rate they got.
+function lastGroupRate(cur, home) {
+  if (cur === home) return 0;
+  const hit = [...(live?.data?.items || [])].sort((p, q) => q.createdAt - p.createdAt)
+    .find((x) => !x.deleted && (x.type === 'expense' ? x.currency === cur : x.orig?.currency === cur));
+  return hit ? (hit.type === 'expense' ? hit.rate : hit.orig.rate) : 0;
+}
+async function defaultRate(cur, home) {
+  const own = lastGroupRate(cur, home);
+  if (own) return { rate: own, note: `This is the rate from your group’s last ${cur} entry. Change it if this one was different.` };
+  const r = await fetchRate(cur, home);
+  if (!r) return null;
+  return { rate: r.rate, note: r.date === today() ? 'Today’s market rate is filled in. Change it to the rate you actually got.'
+    : `No internet: this is the market rate from ${shortDate(r.date)}. Change it to the rate you got.` };
+}
+function drawRateBox(el, cur, home, x, note, onChange) {
+  if (cur === home) { el.innerHTML = ''; delete el.dataset.rate; return; }
+  el.innerHTML = `<label for="ra">Exchange rate you got</label>
+    <div class="inline"><input id="ra" inputmode="decimal" value="${esc(x.a)}" placeholder="…" style="flex:1"><span class="small">${esc(cur)} =</span>
+      <input id="rb" inputmode="decimal" value="${esc(x.b)}" placeholder="…" style="flex:1"><span class="small">${esc(home)}</span></div>
+    <div class="small" id="rateNote">${esc(note || 'You can type totals, like 160000 INR = 1005 USD.')}</div>`;
+  el.dataset.rate = String(rateOf(x) || '');
+  for (const [id, key] of [['ra', 'a'], ['rb', 'b']]) {
+    el.querySelector('#' + id).oninput = (e) => { x[key] = e.target.value; x.kept = null; el.dataset.rate = String(rateOf(x) || '');
+      el.querySelector('#rateNote').textContent = 'Using the rate you typed. Totals work too, like 160000 INR = 1005 USD.';
+      onChange();
+    };
+  }
+}
+
 async function shareText(title, text, url) {
   if (navigator.share) {
     try { await navigator.share(url ? { title, text, url } : { title, text }); return; } catch (e) { if (e.name === 'AbortError') return; }
@@ -292,7 +332,8 @@ function downloadCsv(g, items) {
     ...g.people.map((m) => `${m.name} share (${home})`)]];
   for (const x of [...items].reverse()) {
     if (x.type === 'payment') {
-      rows.push([x.date, 'Payment', '', nameOf(g, x.from), nameOf(g, x.to), f(x.amount, home), home, 1, f(x.amount, home), ...g.people.map(() => '')]);
+      const o = x.orig || { amount: x.amount, currency: home, rate: 1 };
+      rows.push([x.date, 'Payment', '', nameOf(g, x.from), nameOf(g, x.to), f(o.amount, o.currency), o.currency, o.rate, f(x.amount, home), ...g.people.map(() => '')]);
     } else {
       const owed = owedBy(x, g.members, home);
       rows.push([x.date, 'Expense', x.desc, nameOf(g, x.paidBy), '', f(x.amount, x.currency), x.currency, x.rate,
@@ -317,6 +358,14 @@ function groupView(g, d, me) {
   const costs = tripCosts(items, g.members, home);
   const ps = g.pool ? poolStats(items, g.members, home, POOL_ID) : null;
   const money = (v) => esc(formatMoney(v, home));
+  // What was put into the pool in other currencies, e.g. "₹1,60,000".
+  const byCur = {};
+  for (const x of items) {
+    if (x.type !== 'payment' || !x.orig) continue;
+    if (x.to === POOL_ID) byCur[x.orig.currency] = (byCur[x.orig.currency] || 0) + x.orig.amount;
+    if (x.from === POOL_ID) byCur[x.orig.currency] = (byCur[x.orig.currency] || 0) - x.orig.amount;
+  }
+  const collected = Object.entries(byCur).filter(([, v]) => v > 0).map(([c, v]) => formatMoney(v, c)).join(' + ');
   const tab = (key, label, href) => `<a href="${esc(href)}" class="${sub === key ? 'on' : ''}">${label}</a>`;
   let body = '';
 
@@ -324,7 +373,7 @@ function groupView(g, d, me) {
     body = `
       ${ps ? `<div class="card"><div class="small">Trip pool</div>
         <div class="big ${ps.left < 0 ? 'neg' : ''}">${ps.left >= 0 ? money(ps.left) + ' left' : money(-ps.left) + ' overspent'}</div>
-        <div class="small">Put in ${money(ps.total)} · spent ${money(ps.spent)}${ps.left < 0 ? '. The pool has paid out more than was put in. Is a contribution missing?' : ''}</div>
+        <div class="small">Put in ${money(ps.total)}${collected ? ` (${esc(collected)})` : ''} · spent ${money(ps.spent)}${ps.left < 0 ? '. The pool has paid out more than was put in. Is a contribution missing?' : ''}</div>
         <p style="margin:10px 0 0"><button id="topup">Add money to pool</button></p></div>` : ''}
       <div class="list">${g.people.map((m) => {
         const v = bal[m.id];
@@ -371,7 +420,8 @@ function groupView(g, d, me) {
         <div class="small">Your trip cost so far: ${money(costs[me].cost)}${costs[me].personal ? ` (${money(costs[me].personal)} personal)` : ''}${ps ? ` · pool has ${money(ps.left)} left` : ''}</div>
         <div class="small">Group spent ${money(spent)} in total</div></div>
       ${items.length ? `<div class="list">${items.map((x) => itemRow(x, g, me, gid)).join('')}</div>`
-      : '<p class="empty">No expenses yet. Tap “Add expense” when someone pays for something.</p>'}`;
+      : '<p class="empty">No expenses yet. Tap “Add expense” when someone pays for something.</p>'}
+      ${g.pool ? '' : '<p class="small">Put money together in a common kitty? Pick “Trip pool” under “Paid by” for anything paid from it, and record who put in what on the Balances tab.</p>'}`;
   }
 
   if (!render(`
@@ -448,7 +498,7 @@ function itemRow(x, g, me, gid) {
         : `${nameOf(g, x.from, me)} paid ${nameOf(g, x.to, me)}`;
     return `<a class="row" href="#/g/${esc(gid)}/p/${esc(x.id)}">${day}
       <div class="grow"><div class="title">${esc(title)}</div><div class="small">${x.to === POOL_ID || x.from === POOL_ID ? 'Pool' : 'Payment'}</div></div>
-      <div class="right">${money(x.amount)}</div></a>`;
+      <div class="right">${money(x.amount)}${x.orig ? `<div class="small">${esc(formatMoney(x.orig.amount, x.orig.currency))}</div>` : ''}</div></a>`;
   }
   const total = convert(x.amount, x.currency, home, x.rate);
   const myShare = owedBy(x, g.members, home)[me] || 0;
@@ -490,7 +540,7 @@ function expenseEditor(g, d, me) {
   const id = old ? old.id : newId(); // made once, so a double tap cannot save two copies
 
   const f = old ? {
-    desc: old.desc, amount: String(fromMinor(old.amount, old.currency)), currency: old.currency, rate: String(old.rate),
+    desc: old.desc, amount: String(fromMinor(old.amount, old.currency)), currency: old.currency, x: rateState(old.currency !== home ? old.rate : 0),
     date: old.date || today(), paidBy: old.paidBy, mode: old.split.mode,
     vals: Object.fromEntries(g.people.map((m) => {
       const w = old.split.weights[m.id] || 0;
@@ -500,7 +550,7 @@ function expenseEditor(g, d, me) {
     })),
   } : {
     desc: '', amount: '', currency: CURRENCIES[LS.get('split:cur:' + gid, home)] ? LS.get('split:cur:' + gid, home) : home,
-    rate: '', date: today(), paidBy: g.members.some((m) => m.id === LS.get('split:payer:' + gid, me)) ? LS.get('split:payer:' + gid, me) : me, mode: 'equal',
+    x: rateState(0), date: today(), paidBy: g.members.some((m) => m.id === LS.get('split:payer:' + gid, me)) ? LS.get('split:payer:' + gid, me) : me, mode: 'equal',
     vals: Object.fromEntries(g.people.map((m) => [m.id, true])),
   };
   let rateNote = '';
@@ -514,7 +564,9 @@ function expenseEditor(g, d, me) {
         <select id="cur" style="width:96px">${currencyOptions(f.currency, home, true)}</select></div>
       <div id="rateBox"></div>
       <label for="paid">Paid by</label>
-      <select id="paid">${g.members.map((m) => `<option value="${esc(m.id)}" ${m.id === f.paidBy ? 'selected' : ''}>${esc(nameOf(g, m.id, me))}</option>`).join('')}</select>
+      <select id="paid">${g.people.map((m) => `<option value="${esc(m.id)}" ${m.id === f.paidBy ? 'selected' : ''}>${esc(nameOf(g, m.id, me))}</option>`).join('')}
+        <option value="${POOL_ID}" ${f.paidBy === POOL_ID ? 'selected' : ''}>${POOL_NAME} (common money)</option></select>
+      <div class="small" id="paidNote"></div>
       <label for="date">Date</label><input id="date" type="date" value="${esc(f.date)}">
       <label>Split</label>
       <div class="seg">${Object.entries(MODES).map(([k, v]) => `<button type="button" data-mode="${k}">${v}</button>`).join('')}</div>
@@ -531,7 +583,7 @@ function expenseEditor(g, d, me) {
   function compute() {
     const amount = toMinor(f.amount, f.currency);
     const foreign = f.currency !== home;
-    const rate = foreign ? num(f.rate) : 1;
+    const rate = foreign ? rateOf(f.x) : 1;
     const weights = {};
     for (const m of g.people) {
       const v = f.vals[m.id];
@@ -552,13 +604,7 @@ function expenseEditor(g, d, me) {
     return { amount, rate, split, error };
   }
 
-  function drawRate() {
-    if (f.currency === home) { q('#rateBox').innerHTML = ''; return; }
-    q('#rateBox').innerHTML = `<label for="rate">Exchange rate: 1 ${esc(f.currency)} = ? ${esc(home)}</label>
-      <input id="rate" inputmode="decimal" value="${esc(f.rate)}" placeholder="Fetching today’s rate…">
-      <div class="small" id="rateNote">${esc(rateNote)}</div>`;
-    q('#rate').oninput = (e) => { f.rate = e.target.value; refresh(); };
-  }
+  function drawRate() { drawRateBox(q('#rateBox'), f.currency, home, f.x, rateNote, refresh); }
 
   function drawRows() {
     $app.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === f.mode));
@@ -594,16 +640,12 @@ function expenseEditor(g, d, me) {
   async function currencyChanged() {
     rateNote = '';
     drawRate();
-    if (f.currency !== home && !f.rate) {
+    if (f.currency !== home && !rateOf(f.x)) {
       const want = f.currency;
-      const r = await fetchRate(want, home);
-      if (f.currency !== want || !q('#rate')) return; // the user moved on while this was loading
-      if (r && !f.rate) {
-        f.rate = String(r.rate); q('#rate').value = f.rate;
-        rateNote = r.date === today() ? 'Today’s rate is filled in. Change it if you got a different rate.'
-          : `No internet: this is the rate from ${shortDate(r.date)}. Change it if you know today’s.`;
-      } else if (!r) { q('#rate').placeholder = 'Type the rate'; rateNote = 'Could not fetch a rate. Type the one you got.'; }
-      q('#rateNote').textContent = rateNote;
+      const r = await defaultRate(want, home);
+      if (f.currency !== want || !q('#ra')) return; // the user moved on while this was loading
+      if (r && !rateOf(f.x)) { setRate(f.x, r.rate); rateNote = r.note; } else if (!r) rateNote = 'Could not fetch a rate. Type the one you got.';
+      drawRate();
     }
     if (f.mode === 'exact') drawRows();
     refresh();
@@ -611,8 +653,10 @@ function expenseEditor(g, d, me) {
 
   q('#desc').oninput = (e) => { f.desc = e.target.value; };
   q('#amt').oninput = (e) => { f.amount = e.target.value; refresh(); };
-  q('#cur').onchange = (e) => { f.currency = e.target.value; f.rate = ''; currencyChanged(); };
-  q('#paid').onchange = (e) => { f.paidBy = e.target.value; };
+  q('#cur').onchange = (e) => { f.currency = e.target.value; f.x = rateState(0); currencyChanged(); };
+  const paidNote = () => { q('#paidNote').textContent = f.paidBy === POOL_ID ? 'Paid out of the money everyone put together. Nobody is owed for this; it comes off the pool.' : ''; };
+  q('#paid').onchange = (e) => { f.paidBy = e.target.value; paidNote(); };
+  paidNote();
   q('#date').onchange = (e) => { f.date = e.target.value; };
   $app.querySelectorAll('[data-mode]').forEach((b) => {
     b.onclick = () => {
@@ -643,6 +687,10 @@ function expenseEditor(g, d, me) {
       rate: f.currency === home ? 1 : c.rate, date: /^\d{4}-\d{2}-\d{2}$/.test(f.date) ? f.date : today(), paidBy: f.paidBy, split: c.split,
       createdBy: old ? (old.createdBy || me) : me, createdAt: old ? old.createdAt : now, updatedBy: me, updatedAt: now, deleted: false,
     };
+    if (item.paidBy === POOL_ID && !live.data.group.pool) { // first use of the pool starts it
+      store.addMember(gid, { id: POOL_ID, name: POOL_NAME });
+      log(gid, me, g, 'started a trip pool');
+    }
     store.putItem(gid, item);
     LS.set('split:cur:' + gid, f.currency);
     LS.set('split:payer:' + gid, f.paidBy);
@@ -677,38 +725,86 @@ function paymentEditor(g, d, me) {
   const has = (mid) => g.members.some((m) => m.id === mid);
   const from = old ? old.from : (pre && has(pre.from) ? pre.from : me);
   const to = old ? old.to : (pre && has(pre.to) ? pre.to : g.people.find((m) => m.id !== from)?.id);
-  const amt = old ? old.amount : (pre ? pre.amount : 0);
+  const start = old ? (old.orig || { amount: old.amount, currency: home, rate: 0 }) : { amount: pre ? pre.amount : 0, currency: home, rate: 0 };
+  const f = { amount: start.amount ? String(fromMinor(start.amount, start.currency)) : '', currency: start.currency, x: rateState(start.rate) };
+  let rateNote = '';
   const opts = (sel) => g.members.map((m) => `<option value="${esc(m.id)}" ${m.id === sel ? 'selected' : ''}>${esc(nameOf(g, m.id, me))}</option>`).join('');
   render(`
     <header class="top">${back('#/g/' + gid + '/balances')}<h1>${old ? 'Edit payment' : to === POOL_ID ? 'Add money to pool' : 'Record a payment'}</h1></header>
     <div class="card">
       <label for="from">Who paid</label><select id="from">${opts(from)}</select>
       <label for="to">Paid to</label><select id="to">${opts(to)}</select>
-      <label for="amt">Amount (${esc(home)})</label><input id="amt" inputmode="decimal" value="${amt ? esc(fromMinor(amt, home)) : ''}">
+      <label for="amt">Amount</label>
+      <div class="inline"><input id="amt" inputmode="decimal" placeholder="0" value="${esc(f.amount)}" style="flex:1">
+        <select id="cur" style="width:96px">${currencyOptions(f.currency, home, true)}</select></div>
+      <div id="rateBox"></div>
+      <div id="hint" class="hint"></div>
       <label for="date">Date</label><input id="date" type="date" value="${esc(old ? old.date || today() : today())}">
       <p class="small">Record this once the money has actually been paid (cash, UPI or bank). Only one of you needs to record it.</p>
       <div class="actions">${old ? '<button class="danger" id="del">Delete</button>' : ''}<button class="primary" id="save">Save payment</button></div>
     </div>`, true);
   const q = (s) => $app.querySelector(s);
+
+  // The amount in the group currency is what the balances use; the original is kept beside it.
+  function compute() {
+    const foreign = f.currency !== home;
+    const typed = toMinor(f.amount, f.currency);
+    const rate = foreign ? rateOf(f.x) : 1;
+    let error = null;
+    if (!String(f.amount).trim()) error = 'Enter the amount.';
+    else if (!typed || typed > MAX_AMOUNT) error = amountHelp(f.currency);
+    else if (foreign && !(rate > 0 && rate <= MAX_RATE)) error = 'Enter the exchange rate you got.';
+    const amount = error ? 0 : convert(typed, f.currency, home, rate);
+    if (!error && !(amount > 0 && amount <= MAX_AMOUNT)) error = 'That comes to nothing in ' + home + '. Check the rate.';
+    return { foreign, typed, rate, amount, error };
+  }
+  function refresh() {
+    const c = compute(); const hint = q('#hint');
+    if (c.error && String(f.amount).trim()) { hint.className = 'hint neg'; hint.textContent = c.error; }
+    else if (!c.error && c.foreign) { hint.className = 'hint small'; hint.textContent = `${formatMoney(c.typed, f.currency)} = ${formatMoney(c.amount, home)}`; }
+    else { hint.className = 'hint'; hint.textContent = ''; }
+  }
+  const drawRate = () => drawRateBox(q('#rateBox'), f.currency, home, f.x, rateNote, refresh);
+  async function currencyChanged() {
+    rateNote = ''; drawRate();
+    if (f.currency !== home && !rateOf(f.x)) {
+      const want = f.currency;
+      const r = await defaultRate(want, home);
+      if (f.currency !== want || !q('#ra')) return;
+      if (r && !rateOf(f.x)) { setRate(f.x, r.rate); rateNote = r.note; } else if (!r) rateNote = 'Could not fetch a rate. Type the one you got.';
+      drawRate();
+    }
+    refresh();
+  }
+  q('#amt').oninput = (e) => { f.amount = e.target.value; refresh(); };
+  q('#cur').onchange = (e) => { f.currency = e.target.value; f.x = rateState(0); currencyChanged(); };
+
+  // Rebuilds the stored record; a cleaned item carries `orig`, which the database does not hold.
+  const record = (p) => {
+    const doc = { id, type: 'payment', from: p.from, to: p.to, amount: p.amount, date: p.date,
+      createdBy: p.createdBy, createdAt: p.createdAt, updatedBy: me, updatedAt: Date.now(), deleted: p.deleted };
+    if (p.orig) Object.assign(doc, { currency: p.orig.currency, rate: p.orig.rate, desc: String(p.orig.amount) });
+    return doc;
+  };
   let done = false;
   q('#save').onclick = () => {
     if (done) return;
-    const f = q('#from').value; const t = q('#to').value;
-    const amount = toMinor(q('#amt').value, home);
-    if (f === t) return toast('Pick two different people.');
-    if (!amount || amount > MAX_AMOUNT) return toast(q('#amt').value.trim() ? amountHelp(home) : 'Enter the amount.');
+    const fr = q('#from').value; const t = q('#to').value;
+    const c = compute();
+    if (fr === t) return toast('Pick two different people.');
+    if (c.error) return toast(c.error);
     if (changedSince(old)) return toast(STALE);
     const now = Date.now();
     const twin = live.data.items.find((x) => x.type === 'payment' && !x.deleted && x.id !== id
-      && x.from === f && x.to === t && x.amount === amount && now - x.createdAt < 2 * 86400000);
+      && x.from === fr && x.to === t && x.amount === c.amount && now - x.createdAt < 2 * 86400000);
     if (twin && !confirm(`${nameOf(g, twin.createdBy, me)} already recorded this same payment on ${stamp(twin.createdAt)}. Record it a second time?`)) return;
     done = true; q('#save').disabled = true;
     const date = q('#date').value;
-    store.putItem(gid, {
-      id, type: 'payment', from: f, to: t, amount, date: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : today(),
-      createdBy: old ? (old.createdBy || me) : me, createdAt: old ? old.createdAt : now, updatedBy: me, updatedAt: now, deleted: false,
-    });
-    log(gid, me, g, `${old ? 'edited a payment' : 'recorded a payment'}: ${nameOf(g, f, null)} paid ${nameOf(g, t, null)} ${formatMoney(amount, home)}`);
+    store.putItem(gid, record({ from: fr, to: t, amount: c.amount, date: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : today(),
+      createdBy: old ? (old.createdBy || me) : me, createdAt: old ? old.createdAt : now, deleted: false,
+      orig: c.foreign ? { amount: c.typed, currency: f.currency, rate: c.rate } : null }));
+    const what = c.foreign ? `${formatMoney(c.typed, f.currency)} (${formatMoney(c.amount, home)})` : formatMoney(c.amount, home);
+    log(gid, me, g, `${old ? 'edited a payment' : 'recorded a payment'}: ${nameOf(g, fr, null)} paid ${nameOf(g, t, null)} ${what}`);
     location.hash = '#/g/' + gid + '/balances';
   };
   q('#del')?.addEventListener('click', () => {
@@ -716,10 +812,11 @@ function paymentEditor(g, d, me) {
     if (changedSince(old)) return toast(STALE);
     if (!confirm('Delete this payment?')) return;
     done = true;
-    store.putItem(gid, { ...old, createdBy: old.createdBy || me, updatedBy: me, updatedAt: Date.now(), deleted: true });
+    store.putItem(gid, record({ ...old, createdBy: old.createdBy || me, deleted: true }));
     log(gid, me, g, `deleted a payment (${nameOf(g, old.from, null)} → ${nameOf(g, old.to, null)} ${formatMoney(old.amount, home)})`);
     location.hash = '#/g/' + gid + '/balances';
   });
+  currencyChanged();
 }
 
 // ---------- start ----------

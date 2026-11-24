@@ -49,7 +49,14 @@ export function cleanItem(raw, home) {
   if (raw.type === 'payment') {
     const from = memberOrNull(raw.from); const to = memberOrNull(raw.to);
     if (!from || !to || from === to) return null;
-    return { ...base, type: 'payment', from, to };
+    const out = { ...base, type: 'payment', from, to };
+    // A payment made in another currency keeps what was handed over: `amount` stays in the group
+    // currency (so older versions of the app still add up), the original sits beside it.
+    if (CURRENCIES[raw.currency] && raw.currency !== home && Number.isFinite(raw.rate) && raw.rate > 0 && raw.rate <= MAX_RATE
+      && typeof raw.desc === 'string' && /^[1-9]\d{0,14}$/.test(raw.desc)) {
+      out.orig = { amount: Number(raw.desc), currency: raw.currency, rate: raw.rate };
+    }
+    return out;
   }
   if (raw.type !== 'expense') return null;
   const paidBy = memberOrNull(raw.paidBy);
