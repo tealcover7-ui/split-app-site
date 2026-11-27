@@ -46,10 +46,13 @@ export function findTable(rows) {
     });
   }
   const guess = { desc: -1, amount: -1, date: -1, paidBy: -1, sharedBy: -1 };
+  // `sure` marks a guess the heading states outright. A bare "Name" or "Person" column holds
+  // names, but the heading does not say whether that person paid or it was bought for them.
+  const sure = { desc: false, amount: false, date: false, paidBy: false, sharedBy: false };
   for (const kind of Object.keys(guess)) {
-    for (const re of HEADS[kind]) {
+    for (const [n, re] of HEADS[kind].entries()) {
       const hit = cols.find((c) => c.named && re.test(c.label.toLowerCase()) && !Object.values(guess).includes(c.i));
-      if (hit) { guess[kind] = hit.i; break; }
+      if (hit) { guess[kind] = hit.i; sure[kind] = !(kind === 'paidBy' && n > 0); break; }
     }
   }
   // No usable headings: go by what the columns hold. Only columns before the first gap are
@@ -60,7 +63,19 @@ export function findTable(rows) {
   if (guess.date < 0) guess.date = pick((c) => (c.dates > c.filled / 2 ? c.dates : 0));
   if (guess.amount < 0) guess.amount = pick((c) => (!c.counting && c.dates === 0 && c.numbers > c.filled / 2 ? c.numbers : 0));
   if (guess.desc < 0) guess.desc = pick((c) => (c.texts > c.filled / 2 ? c.textLen : 0));
-  return { headerRow, cols: cols.map(({ i, label, sample }) => ({ i, label, sample })), guess };
+  return { headerRow, cols: cols.map(({ i, label, sample }) => ({ i, label, sample })), guess, sure };
+}
+
+const MONEY_WORDS = {
+  INR: /\binr\b|rupee|₹|\brs\b/, USD: /\busd\b|dollar|\$/, EUR: /\beur\b|euro|€/, GBP: /\bgbp\b|pound|£/, AED: /\baed\b|dirham/,
+  SGD: /\bsgd\b/, THB: /\bthb\b|baht|\bthai\b/, VND: /\bvnd\b|dong/, KHR: /\bkhr\b|riel/, MYR: /\bmyr\b|ringgit/, IDR: /\bidr\b|rupiah/,
+  LKR: /\blkr\b/, NPR: /\bnpr\b/, JPY: /\bjpy\b|\byen\b|¥/, AUD: /\baud\b/, CHF: /\bchf\b|franc/,
+};
+// The currency a heading names ("Amount (THB)", "Cost in dollars"), or null when it names none.
+export function currencyHint(label) {
+  const s = String(label).toLowerCase();
+  const hits = Object.keys(MONEY_WORDS).filter((c) => MONEY_WORDS[c].test(s));
+  return hits.length === 1 ? hits[0] : null;
 }
 
 // A cell -> integer minor units of `cur`, or null when it is not a clear positive amount.

@@ -6,7 +6,7 @@ import { cleanData, GROUP_ID, MAX_AMOUNT, MAX_RATE, POOL_ID, POOL_NAME } from '.
 import { openStore, newId } from './store.js';
 import { readSheets } from './sheet.js';
 import {
-  findTable, amountOf, distinctValues, guessPerson, guessSharers, nameTokens, buildDrafts, draftProblem, markDuplicates, MAX_NAMES, MAX_DRAFTS,
+  findTable, currencyHint, amountOf, distinctValues, guessPerson, guessSharers, nameTokens, buildDrafts, draftProblem, markDuplicates, MAX_NAMES, MAX_DRAFTS,
 } from './import.js';
 
 const $app = document.getElementById('app');
@@ -898,33 +898,61 @@ function impGuessPayers() {
   imp.payers = impNames(imp.map.paidBy);
   if (!imp.payers) { imp.payers = []; imp.map.paidBy = -1; toast('That column has too many different entries to be names, so it is not used for who paid.'); }
   imp.payerAns = {};
+  imp.askPayer = new Set(); // names this phone could not place by itself: these are the ones asked about
   for (const v of imp.payers) {
-    imp.payerAns[v.key] = impRecall('payer', v.key) || guessPerson(v.value, live.data.group.people)
-      || (/pool|kitty|common|contri/i.test(v.value) ? POOL_ID : impTaken(v) ? 'skip' : 'new');
+    const known = impRecall('payer', v.key) || guessPerson(v.value, live.data.group.people);
+    if (!known) imp.askPayer.add(v.key);
+    imp.payerAns[v.key] = known || (/pool|kitty|common|contri/i.test(v.value) ? POOL_ID : impTaken(v) ? 'skip' : 'new');
   }
   impSyncAdded();
   impGuessWhoms();
+}
+// After an answer about who paid changes, the people on offer may have changed too: drop
+// anyone who is no longer there from the "who it was for" answers, and keep the rest.
+function impTidyWhoms() {
+  impSyncAdded();
+  const ids = new Set(impPeople().map((p) => p.id));
+  for (const v of imp.whoms) {
+    const a = imp.sharerAns[v.key];
+    if (a.pick === 'some') a.ids = a.ids.filter((id) => ids.has(id));
+    else if (!['all', 'new'].includes(a.pick) && !ids.has(a.pick)) { imp.sharerAns[v.key] = { pick: 'some', ids: [] }; imp.askWhom.add(v.key); }
+  }
+  impSyncAdded();
 }
 function impGuessWhoms() {
   imp.whoms = impNames(imp.map.sharedBy);
   if (!imp.whoms) { imp.whoms = []; imp.map.sharedBy = -1; toast('That column has too many different entries to be names, so it is not used for who shares.'); }
   imp.sharerAns = {};
+  imp.askWhom = new Set();
   const single = (v) => nameTokens(v.value).length <= 1;
   // Single names first, so "Asha and Ravi" can find people who are only now being added.
   for (const v of imp.whoms.filter(single)) {
     const s = guessSharers(v.value, impPeople());
-    imp.sharerAns[v.key] = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : s.ids.length ? { pick: s.ids[0] } : impTaken(v) ? { pick: 'some', ids: [] } : { pick: 'new' });
+    const known = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : s.ids.length ? { pick: s.ids[0] } : null);
+    // A name already asked about under "who paid" is not asked about a second time.
+    if (!known && !(imp.askPayer.has(v.key) && imp.payerAns[v.key] === 'new')) imp.askWhom.add(v.key);
+    imp.sharerAns[v.key] = known || (impTaken(v) ? { pick: 'some', ids: [] } : { pick: 'new' });
     impSyncAdded();
   }
   for (const v of imp.whoms.filter((x) => !single(x))) {
     const s = guessSharers(v.value, impPeople());
-    imp.sharerAns[v.key] = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : { pick: 'some', ids: s.ids });
+    const known = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : s.ids.length && !s.unknown.length ? { pick: 'some', ids: s.ids } : null);
+    if (!known) imp.askWhom.add(v.key);
+    imp.sharerAns[v.key] = known || { pick: 'some', ids: s.ids };
   }
 }
 function impSetSheet(ix) {
   imp.sheetIx = ix;
   imp.table = findTable(imp.sheets[ix].rows);
   imp.map = { ...imp.table.guess };
+  // Columns to ask about: a needed one that was not found, or one the heading leaves in doubt.
+  imp.askCols = new Set(Object.keys(imp.map).filter((k) => (imp.map[k] < 0 ? k === 'desc' || k === 'amount' : !imp.table.sure[k])));
+  if (imp.askCols.has('paidBy')) imp.askCols.add('sharedBy'); // "did they pay, or was it for them?" needs both
+  // A heading like "Amount (THB)" says the currency; anything but the group's own needs a rate, so it is asked.
+  const home = live.data.group.currency;
+  const hint = currencyHint(imp.table.cols.find((c) => c.i === imp.map.amount)?.label || '');
+  imp.currency = hint || home; imp.x = rateState(0); imp.rateNote = '';
+  imp.askCur = imp.currency !== home;
   impGuessPayers();
 }
 // The answers in the plain form buildDrafts takes.
@@ -981,9 +1009,10 @@ function importPick(me) {
     if (!sheets.length) { e.target.value = ''; $app.querySelector('#reading').textContent = ''; return toast('That sheet has no rows in it.'); }
     const home = live.data.group.currency;
     Object.assign(imp, { fileName: f.name, sheets, currency: home, x: rateState(0), rateNote: '', payerDefault: me, notSharing: new Set(),
-      newIds: {}, added: [], payers: [], whoms: [], drafts: null, edited: false });
-    const usable = sheets.findIndex((s) => { const t = findTable(s.rows); return t.guess.desc >= 0 && t.guess.amount >= 0; });
-    impSetSheet(Math.max(0, usable));
+      newIds: {}, added: [], payers: [], whoms: [], drafts: null, edited: false, showAll: false });
+    const usable = sheets.map((s, i) => { const t = findTable(s.rows); return t.guess.desc >= 0 && t.guess.amount >= 0 ? i : -1; }).filter((i) => i >= 0);
+    imp.askSheet = sheets.length > 1 && usable.length !== 1; // several sheets could be the list, or none plainly is
+    impSetSheet(usable.length ? usable[0] : 0);
     location.hash = `#/g/${gid}/import/ask`;
   };
 }
@@ -993,17 +1022,31 @@ function importAsk(me) {
   const g = live.data.group; const home = g.currency;
   const cols = imp.table.cols;
   const colOpts = (sel, none) => (none ? `<option value="-1" ${sel < 0 ? 'selected' : ''}>${esc(none)}</option>` : '')
-    + cols.map((c) => `<option value="${c.i}" ${c.i === sel ? 'selected' : ''}>${esc(c.label)}${c.sample ? ' · e.g. ' + esc(/^d{4}-d{2}-d{2}$/.test(c.sample) ? shortDate(c.sample) : c.sample) : ''}</option>`).join('');
+    + cols.map((c) => `<option value="${c.i}" ${c.i === sel ? 'selected' : ''}>${esc(c.label)}${c.sample ? ' · e.g. ' + esc(/^\d{4}-\d{2}-\d{2}$/.test(c.sample) ? shortDate(c.sample) : c.sample) : ''}</option>`).join('');
   const people = impPeople();
   const opt = (value, label, sel) => `<option value="${esc(value)}" ${value === sel ? 'selected' : ''}>${esc(label)}</option>`;
   const rowsOf = (v) => `<span class="small">${plural(v.count, 'row', 'rows')}</span>`;
   const colName = (i) => cols.find((c) => c.i === i)?.label || '';
 
-  const payerRows = imp.payers.map((v, i) => `<div class="split-row"><span class="name">${esc(v.value)} ${rowsOf(v)}</span>
+  // Only what could not be worked out is asked. "Change any of this" (imp.showAll) opens the rest.
+  const all = imp.showAll;
+  const KIND = { desc: 'What it was for', amount: 'Amount', date: 'Date', paidBy: 'Who paid', sharedBy: 'Who it was for (who shares it)' };
+  const NONE = { desc: 'Choose a column…', amount: 'Choose a column…', date: 'No date column: use today', paidBy: 'No such column', sharedBy: 'No such column' };
+  const SEL = { desc: 'cdesc', amount: 'camount', date: 'cdate', paidBy: 'cpaid', sharedBy: 'cwhom' };
+  const colKinds = Object.keys(KIND).filter((k) => all || imp.askCols.has(k));
+  const colSel = (k) => `<label for="${SEL[k]}">${KIND[k]}</label><select id="${SEL[k]}" data-col="${k}">${colOpts(imp.map[k], (k === 'desc' || k === 'amount') && imp.map[k] >= 0 ? '' : NONE[k])}</select>`;
+  const colWhy = all ? 'These are my readings of the headings. Change any that are wrong.'
+    : colKinds.includes('desc') || colKinds.includes('amount') ? 'I could not tell these from the headings.'
+      : colKinds.includes('paidBy') && imp.map.paidBy >= 0 ? `The “${colName(imp.map.paidBy)}” column has names, but the heading does not say whether that person paid or it was bought for them. I took it as who paid.`
+        : 'The headings leave these in doubt.';
+
+  const payerList = imp.payers.map((v, i) => [v, i]).filter(([v]) => all || imp.askPayer.has(v.key));
+  const whomList = imp.whoms.map((v, i) => [v, i]).filter(([v]) => all || imp.askWhom.has(v.key));
+  const payerRows = payerList.map(([v, i]) => `<div class="split-row"><span class="name">${esc(v.value)} ${rowsOf(v)}</span>
     <select data-payer="${i}" style="width:56%">${g.people.map((m) => opt(m.id, nameOf(g, m.id, me), imp.payerAns[v.key])).join('')}
       ${impTaken(v) ? '' : opt('new', 'New person: ' + v.value, imp.payerAns[v.key])}
       ${opt(POOL_ID, POOL_NAME + ' (common money)', imp.payerAns[v.key])}${opt('skip', 'Leave these rows out', imp.payerAns[v.key])}</select></div>`).join('');
-  const whomRows = imp.whoms.map((v, i) => {
+  const whomRows = whomList.map(([v, i]) => {
     const a = imp.sharerAns[v.key];
     return `<div class="split-row" style="flex-wrap:wrap"><span class="name">${esc(v.value)} ${rowsOf(v)}</span>
       <select data-whom="${i}" style="width:56%">${opt('all', 'Everyone', a.pick)}${people.map((m) => opt(m.id, m.id === me ? 'You' : m.name, a.pick)).join('')}
@@ -1012,34 +1055,68 @@ function importAsk(me) {
         <span class="name">${esc(m.id === me ? 'You' : m.name)}</span><input type="checkbox" data-whom-of="${i}" value="${esc(m.id)}" ${a.ids.includes(m.id) ? 'checked' : ''}></label>`).join('')}</div>` : ''}</div>`;
   }).join('');
 
+  const showSheet = imp.sheets.length > 1 && (all || imp.askSheet);
+  const showCur = all || imp.askCur || imp.currency !== home;
+  const showPayer = imp.map.paidBy < 0 || payerList.length > 0;
+  const showWhom = imp.map.sharedBy >= 0 ? whomList.length > 0 : all;
+  const asking = (showSheet ? 1 : 0) + colKinds.length + (showCur ? 1 : 0) + (imp.map.paidBy < 0 ? 1 : payerList.length) + (imp.map.sharedBy >= 0 ? whomList.length : 0);
+
+  // What was worked out without asking, said back in plain words.
+  const pn = (id) => (id === me ? 'you' : people.find((p) => p.id === id)?.name || 'someone');
+  const same = (value, name) => value.toLowerCase() === name.toLowerCase();
+  const understood = [];
+  if (!all) {
+    if (imp.sheets.length > 1 && !showSheet) understood.push(`The expenses are on the sheet “${imp.sheets[imp.sheetIx].name}”.`);
+    const SHORT = { desc: 'what it was for', amount: 'the amount', date: 'the date', paidBy: 'who paid', sharedBy: 'who it was for' };
+    const known = Object.keys(SHORT).filter((k) => imp.map[k] >= 0 && !colKinds.includes(k)).map((k) => `“${colName(imp.map[k])}” is ${SHORT[k]}`);
+    if (known.length) understood.push('Columns: ' + known.join(', ') + '.');
+    if (imp.map.date < 0 && !colKinds.includes('date')) understood.push('There is no date column, so each one gets today’s date. You can change it row by row on the next screen.');
+    if (!showCur) understood.push(`The amounts are in ${home}.`);
+    const paid = imp.payers.filter((v) => !imp.askPayer.has(v.key)).map((v) => {
+      const c = imp.payerAns[v.key];
+      const who = c === 'skip' ? 'left out' : c === POOL_ID ? 'the trip pool' : c === 'new' ? 'a new person' : pn(c);
+      return same(v.value, who) ? v.value : `${v.value} = ${who}`;
+    });
+    if (paid.length) understood.push('Who paid: ' + paid.join(', ') + '.');
+    const whom = imp.whoms.filter((v) => !imp.askWhom.has(v.key)).map((v) => {
+      const a = imp.sharerAns[v.key];
+      const who = a.pick === 'all' ? 'everyone' : a.pick === 'new' ? 'a new person' : a.pick === 'some' ? a.ids.map(pn).join(' + ') : pn(a.pick);
+      return same(v.value, who) ? v.value : `${v.value} = ${who}`;
+    });
+    if (whom.length) understood.push('Who it was for: ' + whom.join(', ') + '.');
+    if (imp.map.sharedBy < 0) understood.push('The sheet does not say who each one was for, so each is shared equally by everyone in the group.');
+  }
+
   render(`
-    <header class="top">${back('#/g/' + gid + '/import')}<h1>A few questions</h1></header>
-    <p class="small">${esc(imp.fileName)}: answer these once and they apply to every row. You can still change any single row on the next screen.</p>
-    ${imp.sheets.length > 1 ? `<div class="card"><div class="title">Which sheet has the expenses?</div>
+    <header class="top">${back('#/g/' + gid + '/import')}<h1>${all ? 'Check my reading' : asking ? plural(asking, 'question', 'questions') : 'Nothing to ask'}</h1></header>
+    <p class="small" id="askline">${esc(imp.fileName)}: ${all ? 'everything I read from the sheet is below. Change what is wrong.'
+    : asking ? `I read the sheet and only need you for ${asking === 1 ? 'this' : 'these'}. An answer applies to every row it covers.`
+      : 'I could read all of it. Look over what I understood, then check the list.'}</p>
+    ${understood.length ? `<div class="card" id="understood"><div class="title">What I understood</div>
+      ${understood.map((t) => `<p class="small" style="margin:6px 0 0">${esc(t)}</p>`).join('')}
+      <p style="margin:10px 0 0"><button id="showall">Change any of this</button></p></div>` : ''}
+    ${showSheet ? `<div class="card"><div class="title">Which sheet has the expenses?</div>
       <select id="isheet" style="margin-top:8px">${imp.sheets.map((s, i) => `<option value="${i}" ${i === imp.sheetIx ? 'selected' : ''}>${esc(s.name)} · ${plural(s.rows.length, 'row', 'rows')}</option>`).join('')}</select></div>` : ''}
-    <div class="card"><div class="title">1. Which column is which?</div>
-      <p class="small" style="margin:4px 0 0">These are my guesses from the headings. Change any that are wrong.</p>
-      <label for="cdesc">What it was for</label><select id="cdesc" data-col="desc">${colOpts(imp.map.desc, imp.map.desc < 0 ? 'Choose a column…' : '')}</select>
-      <label for="camount">Amount</label><select id="camount" data-col="amount">${colOpts(imp.map.amount, imp.map.amount < 0 ? 'Choose a column…' : '')}</select>
-      <label for="cdate">Date</label><select id="cdate" data-col="date">${colOpts(imp.map.date, 'No date column: use today')}</select>
-      <label for="cpaid">Who paid</label><select id="cpaid" data-col="paidBy">${colOpts(imp.map.paidBy, 'No such column: I will say below')}</select>
-      <label for="cwhom">Who it was for (who shares it)</label><select id="cwhom" data-col="sharedBy">${colOpts(imp.map.sharedBy, 'No such column: I will say below')}</select>
-    </div>
-    <div class="card"><div class="title">2. What currency are the amounts in?</div>
+    ${colKinds.length ? `<div class="card"><div class="title">Which column is which?</div>
+      <p class="small" style="margin:4px 0 0">${esc(colWhy)}</p>
+      ${colKinds.map(colSel).join('')}</div>` : ''}
+    ${showCur ? `<div class="card"><div class="title">What currency are the amounts in?</div>
       <select id="icur" style="margin-top:8px">${currencyOptions(imp.currency, home)}</select>
-      <div id="rateBox"></div><p class="small" id="curNote" style="margin:8px 0 0"></p></div>
-    <div class="card"><div class="title">3. Who paid?</div>
-      ${imp.map.paidBy >= 0 ? `<p class="small" style="margin:4px 0 8px">These names are in the “${esc(colName(imp.map.paidBy))}” column. Say who each one is.</p>${payerRows}`
+      <div id="rateBox"></div><p class="small" id="curNote" style="margin:8px 0 0"></p></div>` : ''}
+    ${showPayer ? `<div class="card"><div class="title">Who paid?</div>
+      ${imp.map.paidBy >= 0 ? `<p class="small" style="margin:4px 0 8px">${all ? `These names are in the “${esc(colName(imp.map.paidBy))}” column. Say who each one is.`
+    : `Under “${esc(colName(imp.map.paidBy))}”, ${payerList.length === 1 ? 'this name is' : 'these names are'} not in the group. A new person, or someone already here under another name?`}</p>${payerRows}`
     : `<p class="small" style="margin:4px 0 8px">The sheet does not say, so pick who paid for these. If different people paid, pick the main one and change the others on the next screen.</p>
         <select id="ipayer">${g.people.map((m) => opt(m.id, nameOf(g, m.id, me), imp.payerDefault)).join('')}${opt(POOL_ID, POOL_NAME + ' (common money)', imp.payerDefault)}</select>`}
-    </div>
-    <div class="card"><div class="title">4. Who shares them?</div>
-      ${imp.map.sharedBy >= 0 ? `<p class="small" style="margin:4px 0 8px">These are in the “${esc(colName(imp.map.sharedBy))}” column. Say who each one means. A row where that cell is empty is shared by everyone.</p>${whomRows}`
+    </div>` : ''}
+    ${showWhom ? `<div class="card"><div class="title">${imp.map.sharedBy >= 0 ? 'Who was it for?' : 'Who shares them?'}</div>
+      ${imp.map.sharedBy >= 0 ? `<p class="small" style="margin:4px 0 8px">${all ? `These are in the “${esc(colName(imp.map.sharedBy))}” column. Say who each one means. A row where that cell is empty is shared by everyone.`
+    : `Under “${esc(colName(imp.map.sharedBy))}”, I could not tell who ${whomList.length === 1 ? 'this means' : 'these mean'}.`}</p>${whomRows}`
     : `<p class="small" style="margin:4px 0 8px">Each expense is split equally among the people ticked here.</p>
         ${people.map((m) => `<label class="split-row" style="margin:0;color:inherit"><span class="name">${esc(m.id === me ? 'You' : m.name)}</span>
           <input type="checkbox" data-share="${esc(m.id)}" ${imp.notSharing.has(m.id) ? '' : 'checked'}></label>`).join('')}`}
-      ${imp.added.length ? `<p class="small" style="margin:10px 0 0">New to the group, added when you save: <b>${esc(imp.added.map((p) => p.name).join(', '))}</b>.</p>` : ''}
-    </div>
+    </div>` : ''}
+    ${imp.added.length ? `<p class="small" id="joining">New to the group, added when you save: <b>${esc(imp.added.map((p) => p.name).join(', '))}</b>.</p>` : ''}
     <div class="actions"><button class="primary" id="tolist">Check the list</button></div>`, true);
 
   const q = (s) => $app.querySelector(s);
@@ -1058,7 +1135,7 @@ function importAsk(me) {
     };
   });
   $app.querySelectorAll('[data-payer]').forEach((s) => {
-    s.onchange = () => { imp.payerAns[imp.payers[Number(s.dataset.payer)].key] = s.value; impSyncAdded(); impGuessWhoms(); again(); };
+    s.onchange = () => { imp.payerAns[imp.payers[Number(s.dataset.payer)].key] = s.value; impTidyWhoms(); again(); };
   });
   $app.querySelectorAll('[data-whom]').forEach((s) => {
     s.onchange = () => {
@@ -1091,8 +1168,11 @@ function importAsk(me) {
     if (r && !rateOf(imp.x)) { setRate(imp.x, r.rate); imp.rateNote = r.note; } else if (!r) imp.rateNote = 'Could not fetch a rate. Type the one you got.';
     drawRate();
   }
-  q('#icur').onchange = (e) => { imp.currency = e.target.value; imp.x = rateState(0); imp.rateNote = ''; currencyChanged(); };
-  currencyChanged();
+  q('#showall')?.addEventListener('click', () => { imp.showAll = true; window.scrollTo(0, 0); again(); });
+  if (q('#icur')) {
+    q('#icur').onchange = (e) => { imp.currency = e.target.value; imp.x = rateState(0); imp.rateNote = ''; currencyChanged(); };
+    currencyChanged();
+  }
 
   q('#tolist').onclick = () => {
     if (imp.map.desc < 0) return toast('Pick the column that says what each expense was for.');
