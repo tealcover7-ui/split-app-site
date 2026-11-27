@@ -4,6 +4,10 @@ import {
 } from './money.js';
 import { cleanData, GROUP_ID, MAX_AMOUNT, MAX_RATE, POOL_ID, POOL_NAME } from './clean.js';
 import { openStore, newId } from './store.js';
+import { readSheets } from './sheet.js';
+import {
+  findTable, amountOf, distinctValues, guessPerson, guessSharers, nameTokens, buildDrafts, draftProblem, markDuplicates, MAX_NAMES, MAX_DRAFTS,
+} from './import.js';
 
 const $app = document.getElementById('app');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -23,6 +27,7 @@ let lastHtml = '';
 let prefill = null;   // a suggested payment tapped on the Balances tab
 let build = '';       // fingerprint of the running version, shown on the home screen
 let updateReady = false; // a newer version is installed and waiting for a safe moment to load
+let imp = null;       // a spreadsheet being brought in: its rows, the answers given and the draft expenses
 
 // ---------- small helpers ----------
 function toast(msg) {
@@ -157,6 +162,7 @@ function route() {
   window.scrollTo(0, 0);
   document.querySelector('.toast')?.remove();
   lastHtml = '';
+  if (!(parts[0] === 'g' && parts[2] === 'import' && imp?.gid === parts[1])) imp = null;
   if (parts[0] === 'new') { stopLive(); view = null; return newGroupView(); }
   if (parts[0] === 'g' && parts[1]) {
     const gid = parts[1];
@@ -173,6 +179,7 @@ function route() {
         draw();
       });
     }
+    if (parts[2] === 'import' && !imp) imp = { gid, step: 'pick' };
     view = { gid, sub: parts[2] || 'expenses', id: parts[3], drawn: false };
     return draw();
   }
@@ -189,7 +196,7 @@ function notFound(damaged) {
 
 function draw() {
   if (!view || !live) return;
-  const editor = view.sub === 'e' || view.sub === 'p';
+  const editor = view.sub === 'e' || view.sub === 'p' || view.sub === 'import';
   if (editor && view.drawn) return; // do not wipe a form someone is typing into
   const d = live.data;
   if (d.status === 'loading') {
@@ -203,6 +210,7 @@ function draw() {
   if (!me || !g.people.some((m) => m.id === me)) return whoAmI(g, d, view.gid);
   if (view.sub === 'e') { view.drawn = true; return expenseEditor(g, d, me); }
   if (view.sub === 'p') { view.drawn = true; return paymentEditor(g, d, me); }
+  if (view.sub === 'import') { view.drawn = true; return importView(me); }
   groupView(g, d, me);
 }
 
@@ -367,6 +375,10 @@ function groupView(g, d, me) {
   }
   const collected = Object.entries(byCur).filter(([, v]) => v > 0).map(([c, v]) => formatMoney(v, c)).join(' + ');
   const tab = (key, label, href) => `<a href="${esc(href)}" class="${sub === key ? 'on' : ''}">${label}</a>`;
+  // Expenses this phone brought in from a sheet in the last day, for the Undo card.
+  const lastImport = LS.get('split:lastimport:' + gid, null);
+  const importIds = new Set(lastImport && Array.isArray(lastImport.ids) && Date.now() - lastImport.at < 86400000 ? lastImport.ids : []);
+  const fromSheet = items.filter((x) => importIds.has(x.id));
   let body = '';
 
   if (sub === 'balances') {
@@ -393,7 +405,7 @@ function groupView(g, d, me) {
         <p class="small">Tap “Mark paid” only after the money has really moved, and only one of you needs to.</p>`
       : '<p class="empty">Everyone is settled up.</p>'}
       <p class="inline" style="flex-wrap:wrap"><a class="btn" href="#/g/${esc(gid)}/p/new">Record another payment</a>
-        <button id="summary">Share summary</button><button id="csv">Download list</button>
+        <button id="summary">Share summary</button><button id="csv">Download list</button><a class="btn" href="#/g/${esc(gid)}/import">Add from a sheet</a>
         ${g.pool ? '' : '<button id="pool">Start a trip pool</button>'}</p>
       ${g.pool ? '' : '<p class="small">A trip pool is money everyone puts into one kitty for common spending.</p>'}
       <h3>People</h3>
@@ -415,12 +427,17 @@ function groupView(g, d, me) {
     const mine = bal[me] || 0;
     const spent = items.filter((x) => x.type === 'expense').reduce((s, x) => s + convert(x.amount, x.currency, home, x.rate), 0);
     body = `
+      ${fromSheet.length ? `<div class="card"><div class="title">${fromSheet.length} ${fromSheet.length === 1 ? 'expense was' : 'expenses were'} added from your sheet</div>
+        <p class="small" style="margin:4px 0 10px">Tap any of them to change it or to set an uneven split. Wrong sheet? Undo takes them out again.</p>
+        <div class="inline"><button id="impundo">Undo</button><button id="impok">OK</button></div></div>` : ''}`
+      + `
       <div class="card"><div class="big ${mine > 0 ? 'pos' : mine < 0 ? 'neg' : ''}">${mine > 0 ? 'You get back ' + esc(formatMoney(mine, home))
         : mine < 0 ? 'You owe ' + esc(formatMoney(-mine, home)) : 'You are settled up'}</div>
         <div class="small">Your trip cost so far: ${money(costs[me].cost)}${costs[me].personal ? ` (${money(costs[me].personal)} personal)` : ''}${ps ? ` · pool has ${money(ps.left)} left` : ''}</div>
         <div class="small">Group spent ${money(spent)} in total</div></div>
       ${items.length ? `<div class="list">${items.map((x) => itemRow(x, g, me, gid)).join('')}</div>`
       : '<p class="empty">No expenses yet. Tap “Add expense” when someone pays for something.</p>'}
+      <p style="text-align:center"><a class="btn" href="#/g/${esc(gid)}/import">Add many from an Excel sheet</a></p>
       ${g.pool ? '' : '<p class="small">Put money together in a common kitty? Pick “Trip pool” under “Paid by” for anything paid from it, and record who put in what on the Balances tab.</p>'}`;
   }
 
@@ -438,6 +455,19 @@ function groupView(g, d, me) {
   const endNudge = () => { LS.set('split:nudge:' + gid, false); lastHtml = ''; draw(); };
   $app.querySelector('#nudgeshare')?.addEventListener('click', () => { shareGroup(g, gid); endNudge(); });
   $app.querySelector('#nudgedone')?.addEventListener('click', endNudge);
+  const endImport = () => { LS.set('split:lastimport:' + gid, null); lastHtml = ''; draw(); };
+  $app.querySelector('#impok')?.addEventListener('click', endImport);
+  $app.querySelector('#impundo')?.addEventListener('click', () => {
+    // Anything changed by hand since it came in is somebody's work, so it stays.
+    const untouched = fromSheet.filter((x) => x.updatedAt === x.createdAt);
+    const kept = fromSheet.length - untouched.length;
+    if (!untouched.length) { toast('All of them were changed after they came in, so none were taken out.'); return endImport(); }
+    if (!confirm(`Take out the ${untouched.length} ${untouched.length === 1 ? 'expense' : 'expenses'} that came from the sheet?${kept ? ` ${kept} changed since then will stay.` : ''}`)) return;
+    const now = Date.now();
+    for (const x of untouched) store.putItem(gid, { ...x, createdBy: x.createdBy || me, updatedBy: me, updatedAt: now, deleted: true });
+    log(gid, me, g, `took out ${untouched.length} ${untouched.length === 1 ? 'expense' : 'expenses'} that had been added from a sheet`);
+    endImport();
+  });
   if (sub !== 'balances') return;
   $app.querySelectorAll('[data-pay]').forEach((b) => {
     b.onclick = () => { prefill = plan[Number(b.dataset.pay)]; location.hash = `#/g/${gid}/p/new`; };
@@ -819,6 +849,382 @@ function paymentEditor(g, d, me) {
   currencyChanged();
 }
 
+// ---------- add many expenses from a spreadsheet ----------
+// Three screens: pick the file, answer questions about it (which column is what, who each
+// name is, who shares), then check the list row by row. Nothing is saved before the last tap.
+const FILE_ERRORS = {
+  'old-xls': 'This is an old-style Excel file (.xls). Open it in Excel, choose Save As, pick “Excel Workbook (.xlsx)”, and bring that one in.',
+  'too-big': 'That sheet is too big to open here.',
+  'old-browser': 'This browser cannot open Excel files. Save the sheet as CSV and bring that in, or update the browser.',
+};
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+// Everyone an answer can point at: the group's people, plus names from the sheet that will join.
+const impPeople = () => [...live.data.group.people, ...imp.added];
+function impNewPerson(name) {
+  const k = name.toLowerCase();
+  if (!imp.newIds[k]) imp.newIds[k] = 'm' + newId(8);
+  return { id: imp.newIds[k], name: name.slice(0, 30) };
+}
+function impSyncAdded() {
+  const names = new Map();
+  for (const v of imp.payers) if (imp.payerAns[v.key] === 'new') names.set(v.key, v.value);
+  for (const v of imp.whoms) if (imp.sharerAns[v.key]?.pick === 'new') names.set(v.key, v.value);
+  imp.added = [...names.values()].map(impNewPerson);
+}
+// The names found in a column, or null when it is plainly not a column of names.
+function impNames(col) {
+  if (col < 0) return [];
+  const v = distinctValues(imp.sheets[imp.sheetIx].rows, imp.table, col);
+  return v.length > MAX_NAMES ? null : v;
+}
+const impTaken = (v) => live.data.group.members.some((m) => m.name.toLowerCase() === v.key);
+// What this phone answered last time for a name in this group's sheets, if it still makes sense.
+function impRecall(kind, key) {
+  const r = LS.get('split:impnames:' + imp.gid, {})?.[kind]?.[key];
+  const ids = new Set(impPeople().map((p) => p.id));
+  if (kind === 'payer') return r === 'skip' || r === POOL_ID || ids.has(r) ? r : null;
+  if (r === 'all') return { pick: 'all' };
+  const some = Array.isArray(r) ? r.filter((id) => ids.has(id)) : [];
+  return !some.length || some.length !== r.length ? null : some.length === 1 ? { pick: some[0] } : { pick: 'some', ids: some };
+}
+function impRemember(answers) {
+  const old = LS.get('split:impnames:' + imp.gid, {}) || {};
+  const whom = Object.fromEntries(imp.whoms.map((v) => [v.key, imp.sharerAns[v.key].pick === 'all' ? 'all' : answers.sharers[v.key]]));
+  const last = (o) => Object.fromEntries(Object.entries(o).slice(-100));
+  LS.set('split:impnames:' + imp.gid, { payer: last({ ...old.payer, ...answers.payer }), whom: last({ ...old.whom, ...whom }) });
+}
+// First answers to "who is this name?", for the user to correct.
+function impGuessPayers() {
+  imp.payers = impNames(imp.map.paidBy);
+  if (!imp.payers) { imp.payers = []; imp.map.paidBy = -1; toast('That column has too many different entries to be names, so it is not used for who paid.'); }
+  imp.payerAns = {};
+  for (const v of imp.payers) {
+    imp.payerAns[v.key] = impRecall('payer', v.key) || guessPerson(v.value, live.data.group.people)
+      || (/pool|kitty|common|contri/i.test(v.value) ? POOL_ID : impTaken(v) ? 'skip' : 'new');
+  }
+  impSyncAdded();
+  impGuessWhoms();
+}
+function impGuessWhoms() {
+  imp.whoms = impNames(imp.map.sharedBy);
+  if (!imp.whoms) { imp.whoms = []; imp.map.sharedBy = -1; toast('That column has too many different entries to be names, so it is not used for who shares.'); }
+  imp.sharerAns = {};
+  const single = (v) => nameTokens(v.value).length <= 1;
+  // Single names first, so "Asha and Ravi" can find people who are only now being added.
+  for (const v of imp.whoms.filter(single)) {
+    const s = guessSharers(v.value, impPeople());
+    imp.sharerAns[v.key] = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : s.ids.length ? { pick: s.ids[0] } : impTaken(v) ? { pick: 'some', ids: [] } : { pick: 'new' });
+    impSyncAdded();
+  }
+  for (const v of imp.whoms.filter((x) => !single(x))) {
+    const s = guessSharers(v.value, impPeople());
+    imp.sharerAns[v.key] = impRecall('whom', v.key) || (s.all ? { pick: 'all' } : { pick: 'some', ids: s.ids });
+  }
+}
+function impSetSheet(ix) {
+  imp.sheetIx = ix;
+  imp.table = findTable(imp.sheets[ix].rows);
+  imp.map = { ...imp.table.guess };
+  impGuessPayers();
+}
+// The answers in the plain form buildDrafts takes.
+function impAnswers() {
+  const all = impPeople().map((p) => p.id);
+  const payer = {}; const sharers = {};
+  for (const v of imp.payers) payer[v.key] = imp.payerAns[v.key] === 'new' ? impNewPerson(v.value).id : imp.payerAns[v.key];
+  for (const v of imp.whoms) {
+    const a = imp.sharerAns[v.key];
+    sharers[v.key] = (a.pick === 'all' ? all : a.pick === 'new' ? [impNewPerson(v.value).id] : a.pick === 'some' ? a.ids : [a.pick]).filter((id) => all.includes(id));
+  }
+  return {
+    currency: imp.currency, today: today(), payer, sharers,
+    payerDefault: imp.map.paidBy >= 0 ? null : imp.payerDefault,
+    sharersDefault: all.filter((id) => !imp.notSharing.has(id)),
+  };
+}
+
+function importView(me) {
+  imp.step = view.id === 'review' && imp.drafts ? 'review' : view.id === 'ask' && imp.sheets ? 'ask' : 'pick';
+  importDraw(me);
+}
+function importDraw(me) {
+  if (!imp || live?.data?.status !== 'ok') return;
+  if (imp.step === 'ask') return importAsk(me);
+  if (imp.step === 'review') return importReview(me);
+  importPick(me);
+}
+
+function importPick(me) {
+  const { gid } = imp;
+  const mine = imp;
+  render(`
+    <header class="top">${back('#/g/' + gid)}<h1>Add from a sheet</h1></header>
+    <div class="card"><div class="big">Bring in many expenses at once</div>
+      <p class="small">Pick an Excel file (.xlsx) or a CSV file that has one expense on each row. You will be asked a few questions about it, then you can check and change every row. Nothing is added until you say so.</p>
+      <label for="file">The sheet</label><input id="file" type="file" accept=".xlsx,.csv,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,text/comma-separated-values">
+      <p class="small" id="reading"></p>
+      <p class="small">It needs a column saying what each expense was for and a column with the amount. Date, who paid and who it was for are used when the sheet has them.
+        In Google Sheets: File › Download › Microsoft Excel. The file itself stays on this phone; only the expenses you approve go to the group.</p>
+    </div>`, true);
+  $app.querySelector('#file').onchange = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (f.size > 15e6) { e.target.value = ''; return toast('That file is over 15 MB, which is too big to open here.'); }
+    $app.querySelector('#reading').textContent = 'Reading the sheet…';
+    let sheets;
+    try { sheets = await readSheets(new Uint8Array(await f.arrayBuffer()), f.name); } catch (err) {
+      if (imp !== mine || imp.step !== 'pick') return;
+      e.target.value = ''; $app.querySelector('#reading').textContent = '';
+      return toast(FILE_ERRORS[err.message] || 'That file could not be read as a spreadsheet. Use an Excel file (.xlsx) or a CSV file.');
+    }
+    if (imp !== mine || imp.step !== 'pick') return; // left this screen while the file was being read
+    if (!sheets.length) { e.target.value = ''; $app.querySelector('#reading').textContent = ''; return toast('That sheet has no rows in it.'); }
+    const home = live.data.group.currency;
+    Object.assign(imp, { fileName: f.name, sheets, currency: home, x: rateState(0), rateNote: '', payerDefault: me, notSharing: new Set(),
+      newIds: {}, added: [], payers: [], whoms: [], drafts: null, edited: false });
+    const usable = sheets.findIndex((s) => { const t = findTable(s.rows); return t.guess.desc >= 0 && t.guess.amount >= 0; });
+    impSetSheet(Math.max(0, usable));
+    location.hash = `#/g/${gid}/import/ask`;
+  };
+}
+
+function importAsk(me) {
+  const { gid } = imp;
+  const g = live.data.group; const home = g.currency;
+  const cols = imp.table.cols;
+  const colOpts = (sel, none) => (none ? `<option value="-1" ${sel < 0 ? 'selected' : ''}>${esc(none)}</option>` : '')
+    + cols.map((c) => `<option value="${c.i}" ${c.i === sel ? 'selected' : ''}>${esc(c.label)}${c.sample ? ' · e.g. ' + esc(/^d{4}-d{2}-d{2}$/.test(c.sample) ? shortDate(c.sample) : c.sample) : ''}</option>`).join('');
+  const people = impPeople();
+  const opt = (value, label, sel) => `<option value="${esc(value)}" ${value === sel ? 'selected' : ''}>${esc(label)}</option>`;
+  const rowsOf = (v) => `<span class="small">${plural(v.count, 'row', 'rows')}</span>`;
+  const colName = (i) => cols.find((c) => c.i === i)?.label || '';
+
+  const payerRows = imp.payers.map((v, i) => `<div class="split-row"><span class="name">${esc(v.value)} ${rowsOf(v)}</span>
+    <select data-payer="${i}" style="width:56%">${g.people.map((m) => opt(m.id, nameOf(g, m.id, me), imp.payerAns[v.key])).join('')}
+      ${impTaken(v) ? '' : opt('new', 'New person: ' + v.value, imp.payerAns[v.key])}
+      ${opt(POOL_ID, POOL_NAME + ' (common money)', imp.payerAns[v.key])}${opt('skip', 'Leave these rows out', imp.payerAns[v.key])}</select></div>`).join('');
+  const whomRows = imp.whoms.map((v, i) => {
+    const a = imp.sharerAns[v.key];
+    return `<div class="split-row" style="flex-wrap:wrap"><span class="name">${esc(v.value)} ${rowsOf(v)}</span>
+      <select data-whom="${i}" style="width:56%">${opt('all', 'Everyone', a.pick)}${people.map((m) => opt(m.id, m.id === me ? 'You' : m.name, a.pick)).join('')}
+        ${impTaken(v) || nameTokens(v.value).length > 1 ? '' : opt('new', 'New person: ' + v.value, a.pick)}${opt('some', 'Choose people…', a.pick)}</select>
+      ${a.pick === 'some' ? `<div style="width:100%;padding:4px 0 0 12px">${people.map((m) => `<label class="split-row" style="margin:0;color:inherit;border:0;padding:4px 0">
+        <span class="name">${esc(m.id === me ? 'You' : m.name)}</span><input type="checkbox" data-whom-of="${i}" value="${esc(m.id)}" ${a.ids.includes(m.id) ? 'checked' : ''}></label>`).join('')}</div>` : ''}</div>`;
+  }).join('');
+
+  render(`
+    <header class="top">${back('#/g/' + gid + '/import')}<h1>A few questions</h1></header>
+    <p class="small">${esc(imp.fileName)}: answer these once and they apply to every row. You can still change any single row on the next screen.</p>
+    ${imp.sheets.length > 1 ? `<div class="card"><div class="title">Which sheet has the expenses?</div>
+      <select id="isheet" style="margin-top:8px">${imp.sheets.map((s, i) => `<option value="${i}" ${i === imp.sheetIx ? 'selected' : ''}>${esc(s.name)} · ${plural(s.rows.length, 'row', 'rows')}</option>`).join('')}</select></div>` : ''}
+    <div class="card"><div class="title">1. Which column is which?</div>
+      <p class="small" style="margin:4px 0 0">These are my guesses from the headings. Change any that are wrong.</p>
+      <label for="cdesc">What it was for</label><select id="cdesc" data-col="desc">${colOpts(imp.map.desc, imp.map.desc < 0 ? 'Choose a column…' : '')}</select>
+      <label for="camount">Amount</label><select id="camount" data-col="amount">${colOpts(imp.map.amount, imp.map.amount < 0 ? 'Choose a column…' : '')}</select>
+      <label for="cdate">Date</label><select id="cdate" data-col="date">${colOpts(imp.map.date, 'No date column: use today')}</select>
+      <label for="cpaid">Who paid</label><select id="cpaid" data-col="paidBy">${colOpts(imp.map.paidBy, 'No such column: I will say below')}</select>
+      <label for="cwhom">Who it was for (who shares it)</label><select id="cwhom" data-col="sharedBy">${colOpts(imp.map.sharedBy, 'No such column: I will say below')}</select>
+    </div>
+    <div class="card"><div class="title">2. What currency are the amounts in?</div>
+      <select id="icur" style="margin-top:8px">${currencyOptions(imp.currency, home)}</select>
+      <div id="rateBox"></div><p class="small" id="curNote" style="margin:8px 0 0"></p></div>
+    <div class="card"><div class="title">3. Who paid?</div>
+      ${imp.map.paidBy >= 0 ? `<p class="small" style="margin:4px 0 8px">These names are in the “${esc(colName(imp.map.paidBy))}” column. Say who each one is.</p>${payerRows}`
+    : `<p class="small" style="margin:4px 0 8px">The sheet does not say, so pick who paid for these. If different people paid, pick the main one and change the others on the next screen.</p>
+        <select id="ipayer">${g.people.map((m) => opt(m.id, nameOf(g, m.id, me), imp.payerDefault)).join('')}${opt(POOL_ID, POOL_NAME + ' (common money)', imp.payerDefault)}</select>`}
+    </div>
+    <div class="card"><div class="title">4. Who shares them?</div>
+      ${imp.map.sharedBy >= 0 ? `<p class="small" style="margin:4px 0 8px">These are in the “${esc(colName(imp.map.sharedBy))}” column. Say who each one means. A row where that cell is empty is shared by everyone.</p>${whomRows}`
+    : `<p class="small" style="margin:4px 0 8px">Each expense is split equally among the people ticked here.</p>
+        ${people.map((m) => `<label class="split-row" style="margin:0;color:inherit"><span class="name">${esc(m.id === me ? 'You' : m.name)}</span>
+          <input type="checkbox" data-share="${esc(m.id)}" ${imp.notSharing.has(m.id) ? '' : 'checked'}></label>`).join('')}`}
+      ${imp.added.length ? `<p class="small" style="margin:10px 0 0">New to the group, added when you save: <b>${esc(imp.added.map((p) => p.name).join(', '))}</b>.</p>` : ''}
+    </div>
+    <div class="actions"><button class="primary" id="tolist">Check the list</button></div>`, true);
+
+  const q = (s) => $app.querySelector(s);
+  const again = () => importDraw(me);
+  q('#isheet')?.addEventListener('change', (e) => { impSetSheet(Number(e.target.value)); again(); });
+  $app.querySelectorAll('[data-col]').forEach((s) => {
+    s.onchange = () => {
+      const kind = s.dataset.col; const col = Number(s.value);
+      const was = { ...imp.map };
+      // One column cannot be two things; the other use gives way.
+      for (const k of Object.keys(imp.map)) if (k !== kind && col >= 0 && imp.map[k] === col) imp.map[k] = -1;
+      imp.map[kind] = col;
+      // Answers about names are kept unless the column they came from changed.
+      if (imp.map.paidBy !== was.paidBy) impGuessPayers(); else if (imp.map.sharedBy !== was.sharedBy) impGuessWhoms();
+      again();
+    };
+  });
+  $app.querySelectorAll('[data-payer]').forEach((s) => {
+    s.onchange = () => { imp.payerAns[imp.payers[Number(s.dataset.payer)].key] = s.value; impSyncAdded(); impGuessWhoms(); again(); };
+  });
+  $app.querySelectorAll('[data-whom]').forEach((s) => {
+    s.onchange = () => {
+      const v = imp.whoms[Number(s.dataset.whom)]; const old = imp.sharerAns[v.key];
+      imp.sharerAns[v.key] = s.value === 'some' ? { pick: 'some', ids: old.pick === 'some' ? old.ids : [] } : { pick: s.value };
+      impSyncAdded(); again();
+    };
+  });
+  $app.querySelectorAll('[data-whom-of]').forEach((c) => {
+    c.onchange = () => {
+      const a = imp.sharerAns[imp.whoms[Number(c.dataset.whomOf)].key];
+      a.ids = c.checked ? [...a.ids, c.value] : a.ids.filter((id) => id !== c.value);
+    };
+  });
+  $app.querySelectorAll('[data-share]').forEach((c) => {
+    c.onchange = () => { if (c.checked) imp.notSharing.delete(c.dataset.share); else imp.notSharing.add(c.dataset.share); };
+  });
+  q('#ipayer')?.addEventListener('change', (e) => { imp.payerDefault = e.target.value; });
+
+  const drawRate = () => {
+    drawRateBox(q('#rateBox'), imp.currency, home, imp.x, imp.rateNote, () => {});
+    q('#curNote').textContent = imp.currency === home ? '' : `Every amount in the sheet is read as ${imp.currency} and turned into ${home} at this rate.`;
+  };
+  async function currencyChanged() {
+    drawRate();
+    if (imp.currency === home || rateOf(imp.x)) return;
+    const mine = imp; const want = imp.currency;
+    const r = await defaultRate(want, home);
+    if (imp !== mine || imp.currency !== want || !q('#ra')) return; // moved on while this was loading
+    if (r && !rateOf(imp.x)) { setRate(imp.x, r.rate); imp.rateNote = r.note; } else if (!r) imp.rateNote = 'Could not fetch a rate. Type the one you got.';
+    drawRate();
+  }
+  q('#icur').onchange = (e) => { imp.currency = e.target.value; imp.x = rateState(0); imp.rateNote = ''; currencyChanged(); };
+  currencyChanged();
+
+  q('#tolist').onclick = () => {
+    if (imp.map.desc < 0) return toast('Pick the column that says what each expense was for.');
+    if (imp.map.amount < 0) return toast('Pick the column that has the amounts.');
+    if (imp.currency !== home && !(rateOf(imp.x) > 0 && rateOf(imp.x) <= MAX_RATE)) return toast('Enter the exchange rate.');
+    if (g.members.length + imp.added.length > 50) return toast('A group can have at most 50 people. Point some of the new names at people already in the group.');
+    if (imp.edited && !confirm('This makes the list again from the sheet. Changes you made to single rows will be lost. Go on?')) return;
+    const out = buildDrafts(imp.sheets[imp.sheetIx].rows, imp.table, imp.map, impAnswers());
+    if (!out.drafts.length) return toast(out.leftOut ? 'Every row was left out by your answers under “Who paid?”.' : 'No row has a clear amount in that column. Check the Amount column.');
+    out.dups = markDuplicates(out.drafts, live.data.items, imp.currency);
+    Object.assign(imp, { drafts: out.drafts, found: out, open: -1, edited: false });
+    location.hash = `#/g/${gid}/import/review`;
+  };
+}
+
+function importReview(me) {
+  const { gid } = imp;
+  const g = live.data.group; const home = g.currency; const cur = imp.currency;
+  const people = impPeople();
+  const rate = cur === home ? 1 : rateOf(imp.x);
+  const nm = (id) => (id === POOL_ID ? POOL_NAME : id === me ? 'You' : people.find((p) => p.id === id)?.name || 'Someone');
+  const ds = imp.drafts;
+  const ready = ds.filter((d) => d.include && !draftProblem(d));
+  const stuck = ds.filter((d) => d.include && draftProblem(d)).length;
+  const total = ready.reduce((s, d) => s + d.amount, 0);
+  const usedNew = imp.added.filter((p) => ready.some((d) => d.paidBy === p.id || d.sharers.includes(p.id)));
+  const forWhom = (d) => {
+    const n = d.sharers.length;
+    if (!n) return 'nobody yet';
+    if (n === 1) return d.sharers[0] === d.paidBy ? 'personal' : `for ${nm(d.sharers[0])} only`;
+    return n === people.length ? 'shared by everyone' : n === 2 ? `shared by ${nm(d.sharers[0])} and ${nm(d.sharers[1])}` : `shared by ${n} people`;
+  };
+  const f = imp.found;
+
+  const row = (d, i) => {
+    const problem = draftProblem(d);
+    const open = imp.open === i;
+    return `<div class="row" style="align-items:flex-start" data-row="${i}">
+      <input type="checkbox" data-inc="${i}" ${d.include ? 'checked' : ''} aria-label="Add this one" style="margin-top:2px">
+      <div class="grow" data-open="${i}" style="cursor:pointer"><div class="title">${d.desc.trim() ? esc(d.desc) : '<span class="neg">No description</span>'}</div>
+        <div class="small">${esc(shortDate(d.date))} · ${d.paidBy ? esc(nm(d.paidBy)) + ' paid' : 'payer not known'} · ${esc(forWhom(d))}</div>
+        ${d.note ? `<div class="small">${esc(d.note)}</div>` : ''}${problem && (d.include || !d.note) ? `<div class="small neg">${esc(problem)} Tap to fix.</div>` : ''}</div>
+      <div class="right" data-open="${i}" style="cursor:pointer">${d.amount ? esc(formatMoney(d.amount, cur)) : '?'}<div class="small" style="color:var(--accent)">${open ? 'Close' : 'Change'}</div></div>
+    </div>${open ? `<div style="padding:0 14px 14px;border-top:1px dashed var(--line)">
+      <label for="idesc">What was it for?</label><input id="idesc" maxlength="80" value="${esc(d.desc)}">
+      <label for="iamt">Amount (${esc(cur)})</label><input id="iamt" inputmode="decimal" value="${d.amount ? esc(String(fromMinor(d.amount, cur))) : ''}">
+      <label for="idate">Date</label><input id="idate" type="date" value="${esc(d.date)}">
+      <label for="ipaid">Paid by</label><select id="ipaid">${d.paidBy ? '' : '<option value="" selected>Choose…</option>'}
+        ${people.map((m) => `<option value="${esc(m.id)}" ${m.id === d.paidBy ? 'selected' : ''}>${esc(nm(m.id))}</option>`).join('')}
+        <option value="${POOL_ID}" ${d.paidBy === POOL_ID ? 'selected' : ''}>${POOL_NAME} (common money)</option></select>
+      <label>Split equally among</label>
+      ${people.map((m) => `<label class="split-row" style="margin:0;color:inherit"><span class="name">${esc(nm(m.id))}</span>
+        <input type="checkbox" data-sh="${esc(m.id)}" ${d.sharers.includes(m.id) ? 'checked' : ''}></label>`).join('')}
+      <div class="actions"><button id="idone" class="primary">Done</button></div></div>` : ''}`;
+  };
+
+  render(`
+    <header class="top">${back('#/g/' + gid + '/import/ask')}<h1>Check the list</h1></header>
+    <div class="card"><div class="big" id="readyline">${plural(ready.length, 'expense', 'expenses')} ready to add</div>
+      <div class="small">Total ${esc(formatMoney(total, cur))}${cur !== home ? ' = ' + esc(formatMoney(convert(total, cur, home, rate), home)) : ''}, from “${esc(imp.fileName)}”.</div>
+      ${stuck ? `<div class="small neg">${plural(stuck, 'ticked row still needs', 'ticked rows still need')} a detail (in red below) and will not be added until fixed.</div>` : ''}
+      ${f.dups ? `<div class="small">${plural(f.dups, 'row is', 'rows are')} already in the group, so not ticked.</div>` : ''}
+      ${f.noAmount ? `<div class="small">${plural(f.noAmount, 'row', 'rows')} had no clear amount and ${f.noAmount === 1 ? 'was' : 'were'} left out.</div>` : ''}
+      ${f.leftOut ? `<div class="small">${plural(f.leftOut, 'row was', 'rows were')} left out as you asked.</div>` : ''}
+      ${f.tooMany ? `<div class="small neg">Only the first ${MAX_DRAFTS} rows are shown. Bring in the rest as a second sheet.</div>` : ''}
+      ${usedNew.length ? `<div class="small">Joining the group with this: <b>${esc(usedNew.map((p) => p.name).join(', '))}</b>.</div>` : ''}
+      <div class="actions"><button class="primary" data-add ${ready.length ? '' : 'disabled'}>Add ${plural(ready.length, 'expense', 'expenses')}</button></div>
+      <p class="small" style="margin:10px 0 0">Tap a row to change what it says, who paid or who shares it. Untick a row to leave it out. An uneven split (exact amounts or %) is set afterwards, by opening that expense.</p></div>
+    <div class="list">${ds.map(row).join('')}</div>
+    <div class="actions"><a class="btn" href="#/g/${esc(gid)}/import/ask">Back to the questions</a>
+      <button class="primary" data-add ${ready.length ? '' : 'disabled'}>Add ${plural(ready.length, 'expense', 'expenses')}</button></div>`, true);
+
+  const q = (s) => $app.querySelector(s);
+  const again = () => importDraw(me);
+  $app.querySelectorAll('[data-inc]').forEach((c) => { c.onchange = () => { ds[Number(c.dataset.inc)].include = c.checked; imp.edited = true; again(); }; });
+  $app.querySelectorAll('[data-open]').forEach((el) => {
+    el.onclick = () => { const i = Number(el.dataset.open); imp.open = imp.open === i ? -1 : i; again(); };
+  });
+  if (imp.open >= 0 && q('#idesc')) {
+    const d = ds[imp.open];
+    const touch = () => { imp.edited = true; };
+    q('#idesc').oninput = (e) => { d.desc = e.target.value.slice(0, 80); touch(); };
+    q('#iamt').oninput = (e) => { d.amount = amountOf(e.target.value, cur); touch(); };
+    q('#idate').onchange = (e) => { if (/^\d{4}-\d{2}-\d{2}$/.test(e.target.value)) d.date = e.target.value; touch(); };
+    q('#ipaid').onchange = (e) => { d.paidBy = e.target.value || null; touch(); };
+    $app.querySelectorAll('[data-sh]').forEach((c) => {
+      c.onchange = () => { d.sharers = people.map((p) => p.id).filter((id) => (id === c.dataset.sh ? c.checked : d.sharers.includes(id))); touch(); };
+    });
+    q('#idone').onclick = () => { imp.open = -1; again(); };
+  }
+
+  let done = false;
+  $app.querySelectorAll('[data-add]').forEach((b) => {
+    b.onclick = () => {
+      if (done) return;
+      const now = live.data.group; // the group as it is this moment, not as it was when the list was made
+      const list = ds.filter((d) => d.include && !draftProblem(d));
+      if (!list.length) return toast('Nothing is ticked.');
+      const used = new Set(list.flatMap((d) => [d.paidBy, ...d.sharers]));
+      const joining = imp.added.filter((p) => used.has(p.id));
+      const startPool = used.has(POOL_ID) && !now.pool;
+      const known = new Set([...now.members.map((m) => m.id), ...joining.map((p) => p.id), POOL_ID]);
+      if ([...used].some((id) => !known.has(id))) return toast('Someone in this list has been removed from the group since. Go back to the questions and check the names.');
+      const clash = joining.find((p) => now.members.some((m) => m.name.toLowerCase() === p.name.toLowerCase()));
+      if (clash) return toast(`${clash.name} has joined the group since. Go back to the questions and point that name at them.`);
+      if (now.members.length + joining.length + (startPool ? 1 : 0) > 50) return toast('A group can have at most 50 people.');
+      if (!confirm(`Add ${plural(list.length, 'expense', 'expenses')} to “${now.name}”? Everyone in the group will see them.`)) return;
+      done = true; $app.querySelectorAll('[data-add]').forEach((x) => { x.disabled = true; });
+      for (const p of joining) store.addMember(gid, p);
+      const after = { members: [...now.members, ...joining] };
+      if (joining.length) log(gid, me, after, `added ${joining.map((p) => p.name).join(', ')} to the group`);
+      if (startPool) { store.addMember(gid, { id: POOL_ID, name: POOL_NAME }); log(gid, me, after, 'started a trip pool'); }
+      const at = Date.now(); const ids = [];
+      list.forEach((d, i) => {
+        const id = newId(); ids.push(id);
+        store.putItem(gid, {
+          id, type: 'expense', desc: d.desc.trim().slice(0, 80), amount: d.amount, currency: cur, rate,
+          date: /^\d{4}-\d{2}-\d{2}$/.test(d.date) ? d.date : today(), paidBy: d.paidBy,
+          split: { mode: 'equal', weights: Object.fromEntries(d.sharers.map((s) => [s, 1])) },
+          createdBy: me, createdAt: at + i, updatedBy: me, updatedAt: at + i, deleted: false,
+        });
+      });
+      const sum = list.reduce((s, d) => s + convert(d.amount, cur, home, rate), 0);
+      log(gid, me, after, `added ${plural(list.length, 'expense', 'expenses')} from a sheet (${formatMoney(sum, home)} in all)`);
+      LS.set('split:lastimport:' + gid, { at, ids });
+      impRemember(impAnswers());
+      imp = null;
+      location.hash = '#/g/' + gid;
+    };
+  });
+}
+
 // ---------- start ----------
 async function start() {
   try {
@@ -844,7 +1250,7 @@ async function keepUpdated() {
   let reloading = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (!hadWorker || reloading) return; // the very first install is not an update
-    const formOpen = view && view.drawn && (view.sub === 'e' || view.sub === 'p');
+    const formOpen = view && view.drawn && (view.sub === 'e' || view.sub === 'p' || view.sub === 'import');
     if (formOpen) { updateReady = true; toast('A newer version is ready. It will load when you leave this form.'); return; }
     reloading = true; location.reload();
   });
